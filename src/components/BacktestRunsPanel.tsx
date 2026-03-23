@@ -1,7 +1,7 @@
 import React from "react";
 import { Area, AreaChart, CartesianGrid, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 import { Badge, Button, Card, Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./ui";
-import { formatDateTime } from "../lib/platform-client";
+import { formatDateTime, formatMoney } from "../lib/platform-client";
 
 type Strategy = {
   id?: string;
@@ -92,10 +92,7 @@ export function BacktestRunsPanel(props: {
     return null;
   }
 
-  const runs = props.backtests
-    .filter((item) => item.strategyId === props.selectedStrategy?.id)
-    .slice(0, 8);
-
+  const runs = props.backtests.filter((item) => item.strategyId === props.selectedStrategy?.id).slice(0, 8);
   const latestRun = runs[0] || null;
   const curve = (latestRun?.equityCurve || []).map((point) => ({
     time: new Date(point.time * 1000).toLocaleDateString("zh-CN", {
@@ -115,7 +112,7 @@ export function BacktestRunsPanel(props: {
           <div>
             <h2 className="text-lg font-semibold text-zinc-100">回测模块</h2>
             <p className="mt-1 text-sm text-zinc-500">
-              配置回测参数，运行策略，并查看收益、回撤、权益曲线和交易明细。
+              这里负责配置回测参数、查看收益与回撤、检查权益曲线，并追踪每一笔历史成交。
             </p>
           </div>
           <Badge variant="success">{props.selectedStrategy.symbol}</Badge>
@@ -124,7 +121,7 @@ export function BacktestRunsPanel(props: {
         <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
           <ConfigField
             label="回看 K 线数量"
-            hint="用于回测的数据长度。值越大，覆盖的历史区间越长。"
+            hint="用于回测的历史样本长度。数值越大，覆盖的时间区间越长。"
             value={props.config.lookback}
             min={100}
             step={10}
@@ -140,7 +137,7 @@ export function BacktestRunsPanel(props: {
           />
           <ConfigField
             label="手续费（bps）"
-            hint="每次交易的手续费，1 bps = 0.01%。"
+            hint="每次成交的手续费。1 bps = 0.01%。"
             value={props.config.feeBps}
             min={0}
             step={0.5}
@@ -148,7 +145,7 @@ export function BacktestRunsPanel(props: {
           />
           <ConfigField
             label="滑点（bps）"
-            hint="模拟实际成交偏差，值越大越保守。"
+            hint="模拟真实成交偏差。数值越大，结果越保守。"
             value={props.config.slippageBps}
             min={0}
             step={0.5}
@@ -157,71 +154,34 @@ export function BacktestRunsPanel(props: {
         </div>
 
         <div className="grid grid-cols-2 gap-3 text-sm text-zinc-400 xl:grid-cols-4">
-          <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">
-            策略类型：{props.selectedStrategy.template === "python" ? "Python" : "模板"}
-          </div>
-          <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">
-            快线/窗口：{
-              props.selectedStrategy.parameters.fastPeriod
-              || props.selectedStrategy.parameters.breakoutLookback
-              || "--"
-            }
-          </div>
-          <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">
-            慢线：{props.selectedStrategy.parameters.slowPeriod || "--"}
-          </div>
-          <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">
-            最大名义金额：${props.selectedStrategy.risk.maxNotional}
-          </div>
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">策略类型：{props.selectedStrategy.template === "python" ? "Python" : "模板"}</div>
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">快线 / 窗口：{props.selectedStrategy.parameters.fastPeriod || props.selectedStrategy.parameters.breakoutLookback || "--"}</div>
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">慢线：{props.selectedStrategy.parameters.slowPeriod || "--"}</div>
+          <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-3">最大名义金额：{formatMoney(props.selectedStrategy.risk.maxNotional)}</div>
         </div>
 
         <div className="flex items-center gap-3">
           <Button onClick={props.onRunBacktest} disabled={props.busy}>
             {props.busy ? "回测运行中..." : "运行回测"}
           </Button>
-          {latestRun && (
-            <span className="text-sm text-zinc-500">
-              最近一次运行时间：{formatDateTime(latestRun.completedAt)}
-            </span>
-          )}
+          {latestRun ? <span className="text-sm text-zinc-500">最近一次运行时间：{formatDateTime(latestRun.completedAt)}</span> : null}
         </div>
 
-        {latestRun && (
+        {latestRun ? (
           <div className="grid grid-cols-2 gap-3 xl:grid-cols-5">
-            <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4">
-              <div className="text-xs uppercase tracking-[0.18em] text-zinc-500">收益率</div>
-              <div className={`mt-2 text-xl font-semibold ${latestRun.metrics.totalReturnPct >= 0 ? "text-emerald-400" : "text-rose-400"}`}>
-                {latestRun.metrics.totalReturnPct.toFixed(2)}%
-              </div>
-            </div>
-            <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4">
-              <div className="text-xs uppercase tracking-[0.18em] text-zinc-500">夏普</div>
-              <div className="mt-2 text-xl font-semibold text-zinc-100">{latestRun.metrics.sharpe.toFixed(2)}</div>
-            </div>
-            <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4">
-              <div className="text-xs uppercase tracking-[0.18em] text-zinc-500">最大回撤</div>
-              <div className="mt-2 text-xl font-semibold text-amber-400">{latestRun.metrics.maxDrawdownPct.toFixed(2)}%</div>
-            </div>
-            <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4">
-              <div className="text-xs uppercase tracking-[0.18em] text-zinc-500">交易次数</div>
-              <div className="mt-2 text-xl font-semibold text-zinc-100">{latestRun.metrics.trades}</div>
-            </div>
-            <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4">
-              <div className="text-xs uppercase tracking-[0.18em] text-zinc-500">期末权益</div>
-              <div className="mt-2 text-xl font-semibold text-zinc-100">
-                ${latestRun.metrics.endingEquity?.toFixed(2) || "--"}
-              </div>
-            </div>
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4"><div className="text-xs uppercase tracking-[0.18em] text-zinc-500">收益率</div><div className={`mt-2 text-xl font-semibold ${latestRun.metrics.totalReturnPct >= 0 ? "text-emerald-400" : "text-rose-400"}`}>{latestRun.metrics.totalReturnPct.toFixed(2)}%</div></div>
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4"><div className="text-xs uppercase tracking-[0.18em] text-zinc-500">夏普</div><div className="mt-2 text-xl font-semibold text-zinc-100">{latestRun.metrics.sharpe.toFixed(2)}</div></div>
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4"><div className="text-xs uppercase tracking-[0.18em] text-zinc-500">最大回撤</div><div className="mt-2 text-xl font-semibold text-amber-400">{latestRun.metrics.maxDrawdownPct.toFixed(2)}%</div></div>
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4"><div className="text-xs uppercase tracking-[0.18em] text-zinc-500">交易次数</div><div className="mt-2 text-xl font-semibold text-zinc-100">{latestRun.metrics.trades}</div></div>
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4"><div className="text-xs uppercase tracking-[0.18em] text-zinc-500">期末权益</div><div className="mt-2 text-xl font-semibold text-zinc-100">{formatMoney(latestRun.metrics.endingEquity)}</div></div>
           </div>
-        )}
+        ) : null}
 
         <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
           <div className="mb-3 flex items-center justify-between">
             <div>
               <div className="text-sm font-medium text-zinc-100">权益曲线</div>
-              <div className="mt-1 text-xs text-zinc-500">
-                展示最近一次回测过程中账户权益随时间的变化。
-              </div>
+              <div className="mt-1 text-xs text-zinc-500">展示最近一次回测过程中账户权益随时间的变化。</div>
             </div>
             <Badge variant="default">{latestRun?.source || "暂无结果"}</Badge>
           </div>
@@ -240,15 +200,13 @@ export function BacktestRunsPanel(props: {
                   <YAxis tick={{ fill: "#71717a", fontSize: 12 }} axisLine={false} tickLine={false} width={72} />
                   <Tooltip
                     contentStyle={{ backgroundColor: "#09090b", border: "1px solid #27272a", borderRadius: 12 }}
-                    formatter={(value: number) => [`$${value.toFixed(2)}`, "权益"]}
+                    formatter={(value: number) => [formatMoney(value), "权益"]}
                   />
                   <Area type="monotone" dataKey="equity" stroke="#10b981" strokeWidth={2} fill="url(#backtestCurveFill)" />
                 </AreaChart>
               </ResponsiveContainer>
             ) : (
-              <div className="flex h-full items-center justify-center text-sm text-zinc-500">
-                先运行一次回测，这里就会显示权益曲线。
-              </div>
+              <div className="flex h-full items-center justify-center text-sm text-zinc-500">先运行一次回测，这里就会显示权益曲线。</div>
             )}
           </div>
         </div>
@@ -256,9 +214,7 @@ export function BacktestRunsPanel(props: {
         <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
           <div className="mb-3">
             <div className="text-sm font-medium text-zinc-100">交易明细</div>
-            <div className="mt-1 text-xs text-zinc-500">
-              展示最近一次回测中的每笔成交，包括方向、成交价、数量和单笔盈亏。
-            </div>
+            <div className="mt-1 text-xs text-zinc-500">展示最近一次回测中的每笔成交，包括方向、价格、数量和单笔盈亏。</div>
           </div>
           {tradeRows.length > 0 ? (
             <Table>
@@ -277,12 +233,10 @@ export function BacktestRunsPanel(props: {
                   <TableRow key={`${trade.time}-${trade.price}-${index}`}>
                     <TableCell>{formatDateTime(trade.time)}</TableCell>
                     <TableCell>{trade.side}</TableCell>
-                    <TableCell>${trade.price.toFixed(2)}</TableCell>
+                    <TableCell>{formatMoney(trade.price)}</TableCell>
                     <TableCell>{trade.quantity.toFixed(6)}</TableCell>
-                    <TableCell>${(trade.fee || 0).toFixed(2)}</TableCell>
-                    <TableCell className={trade.pnl && trade.pnl >= 0 ? "text-emerald-400" : "text-rose-400"}>
-                      ${(trade.pnl || 0).toFixed(2)}
-                    </TableCell>
+                    <TableCell>{formatMoney(trade.fee || 0)}</TableCell>
+                    <TableCell className={(trade.pnl || 0) >= 0 ? "text-emerald-400" : "text-rose-400"}>{formatMoney(trade.pnl || 0)}</TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -298,20 +252,14 @@ export function BacktestRunsPanel(props: {
             <div key={run.id} className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3">
               <div className="flex items-center justify-between gap-3">
                 <span>{formatDateTime(run.completedAt)}</span>
-                <span className={run.metrics.totalReturnPct >= 0 ? "text-emerald-400" : "text-rose-400"}>
-                  {run.metrics.totalReturnPct.toFixed(2)}%
-                </span>
+                <span className={run.metrics.totalReturnPct >= 0 ? "text-emerald-400" : "text-rose-400"}>{run.metrics.totalReturnPct.toFixed(2)}%</span>
               </div>
               <div className="mt-2 text-xs text-zinc-500">
                 夏普 {run.metrics.sharpe.toFixed(2)} | 最大回撤 {run.metrics.maxDrawdownPct.toFixed(2)}% | 胜率 {(run.metrics.winRatePct || 0).toFixed(2)}% | 交易 {run.metrics.trades} 次
               </div>
             </div>
           ))}
-          {runs.length === 0 && (
-            <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3 text-zinc-500">
-              当前策略还没有回测记录。
-            </div>
-          )}
+          {runs.length === 0 ? <div className="rounded-lg border border-zinc-800 bg-zinc-900/40 p-3 text-zinc-500">当前策略还没有回测记录。</div> : null}
         </div>
       </div>
     </Card>

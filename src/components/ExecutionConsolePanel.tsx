@@ -1,6 +1,6 @@
 import React from "react";
 import { Badge, Button, Card } from "./ui";
-import { BrokerTarget, getBrokerTargetLabel, getRuntimeLabel } from "../lib/platform-client";
+import { BrokerTarget, formatMoney, getBrokerTargetLabel, getRuntimeLabel } from "../lib/platform-client";
 
 type Strategy = {
   risk: {
@@ -70,6 +70,7 @@ export function ExecutionConsolePanel(props: {
 }) {
   const brokerOptions = props.brokers.flatMap((item) => item.targets);
   const selectedConnectivity = props.connectivity?.brokers?.find((item) => item.brokerTarget === props.brokerTarget);
+  const needsPassphrase = props.credentialTarget.startsWith("okx:");
 
   return (
     <div className="grid grid-cols-1 gap-6 xl:grid-cols-[0.95fr_1.05fr]">
@@ -78,7 +79,7 @@ export function ExecutionConsolePanel(props: {
           <div>
             <h2 className="text-lg font-semibold text-zinc-100">执行凭证</h2>
             <p className="mt-1 text-sm text-zinc-500">
-              在这里维护券商或交易所的 API 凭证，供沙盒和生产执行使用。
+              在这里维护交易所 API 凭证，供沙盒和生产执行使用。团队正式上线前，应先把模拟环境验证通过。
             </p>
           </div>
           <div className="grid grid-cols-1 gap-3">
@@ -97,25 +98,27 @@ export function ExecutionConsolePanel(props: {
               value={props.apiKey}
               onChange={(e) => props.onApiKeyChange(e.target.value)}
               className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white"
-              placeholder="券商 API Key"
+              placeholder="交易所 API Key"
             />
             <input
               value={props.apiSecret}
               onChange={(e) => props.onApiSecretChange(e.target.value)}
               type="password"
               className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white"
-              placeholder="券商 API Secret"
+              placeholder="交易所 API Secret"
             />
-            <input
-              value={props.apiPassphrase}
-              onChange={(e) => props.onApiPassphraseChange(e.target.value)}
-              type="password"
-              className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white"
-              placeholder="券商 API Passphrase（OKX 必填）"
-            />
+            {needsPassphrase ? (
+              <input
+                value={props.apiPassphrase}
+                onChange={(e) => props.onApiPassphraseChange(e.target.value)}
+                type="password"
+                className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white"
+                placeholder="OKX API Passphrase"
+              />
+            ) : null}
             <Button
               onClick={props.onSaveCredential}
-              disabled={props.busy || !props.apiKey || !props.apiSecret || !props.credentialTarget}
+              disabled={props.busy || !props.apiKey || !props.apiSecret || !props.credentialTarget || (needsPassphrase && !props.apiPassphrase)}
             >
               保存凭证
             </Button>
@@ -142,7 +145,7 @@ export function ExecutionConsolePanel(props: {
       <Card className="border-zinc-800 bg-zinc-950/85">
         <div className="space-y-4 p-6">
           <div className="flex items-center justify-between">
-            <h2 className="text-lg font-semibold text-zinc-100">运行控制台</h2>
+            <h2 className="text-lg font-semibold text-zinc-100">执行控制台</h2>
             <select
               value={props.brokerTarget}
               onChange={(e) => props.onBrokerTargetChange(e.target.value as BrokerTarget)}
@@ -156,29 +159,21 @@ export function ExecutionConsolePanel(props: {
               ))}
             </select>
           </div>
-          <p className="text-sm text-zinc-500">订单发送前会先经过基础风控检查。</p>
+          <p className="text-sm text-zinc-500">订单发送前会先经过基础风控检查。执行失败时，优先检查代理状态与目标交易所联通性。</p>
 
           <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4 text-sm text-zinc-400">
             <div>代理状态：{props.connectivity?.proxy?.configured ? "已配置" : "未配置"}</div>
             <div className="mt-2">HTTP 代理：{props.connectivity?.proxy?.httpProxy || "--"}</div>
             <div className="mt-2">SOCKS 代理：{props.connectivity?.proxy?.socksProxy || "--"}</div>
-            <div className="mt-2">
-              当前目标联通性：{selectedConnectivity ? (selectedConnectivity.ok ? "正常" : "失败") : "未检测"}
-            </div>
-            {!selectedConnectivity?.ok && selectedConnectivity?.error && (
-              <div className="mt-2 text-rose-400">{selectedConnectivity.error}</div>
-            )}
+            <div className="mt-2">当前目标联通性：{selectedConnectivity ? (selectedConnectivity.ok ? "正常" : "失败") : "未检测"}</div>
+            {!selectedConnectivity?.ok && selectedConnectivity?.error ? <div className="mt-2 text-rose-400">{selectedConnectivity.error}</div> : null}
           </div>
 
           <div className="grid grid-cols-2 gap-3">
             <Button onClick={() => props.onExecute("BUY")} disabled={props.busy || !props.selectedStrategy}>
               发送买入
             </Button>
-            <Button
-              variant="outline"
-              onClick={() => props.onExecute("SELL")}
-              disabled={props.busy || !props.selectedStrategy}
-            >
+            <Button variant="outline" onClick={() => props.onExecute("SELL")} disabled={props.busy || !props.selectedStrategy}>
               发送卖出
             </Button>
           </div>
@@ -190,8 +185,8 @@ export function ExecutionConsolePanel(props: {
           </div>
 
           <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4 text-sm text-zinc-400">
-            <div>纸面余额：${props.paperAccount?.balanceUsd?.toFixed?.(2) || "100000.00"}</div>
-            <div className="mt-2">已实现盈亏：${props.paperAccount?.realizedPnl?.toFixed?.(2) || "0.00"}</div>
+            <div>纸面余额：{formatMoney(props.paperAccount?.balanceUsd)}</div>
+            <div className="mt-2">已实现盈亏：{formatMoney(props.paperAccount?.realizedPnl)}</div>
             <div className="mt-2">持仓数：{props.paperAccount?.positions?.length || 0}</div>
           </div>
 
