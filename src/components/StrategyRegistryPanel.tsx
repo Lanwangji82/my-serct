@@ -17,17 +17,6 @@ type Strategy = {
   } | null;
 };
 
-const TEXT = {
-  title: "\u7b56\u7565\u5e93",
-  loaded: "\u5df2\u52a0\u8f7d",
-  strategyCount: "\u4e2a\u7b56\u7565",
-  python: "\u0050\u0079\u0074\u0068\u006f\u006e",
-  template: "\u6a21\u677f",
-  futures: "\u5408\u7ea6",
-  spot: "\u73b0\u8d27",
-  file: "\u6587\u4ef6",
-} as const;
-
 export function StrategyRegistryPanel(props: {
   strategies: Strategy[];
   brokers: BrokerRegistrySummary[];
@@ -38,10 +27,8 @@ export function StrategyRegistryPanel(props: {
     <Card className="border-zinc-800 bg-zinc-950/85">
       <div className="p-6">
         <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-zinc-100">{TEXT.title}</h2>
-          <span className="text-xs text-zinc-500">
-            {TEXT.loaded} {props.strategies.length} {TEXT.strategyCount}
-          </span>
+          <h2 className="text-lg font-semibold text-zinc-100">策略库</h2>
+          <span className="text-xs text-zinc-500">已加载 {props.strategies.length} 个策略</span>
         </div>
         <div className="space-y-3">
           {props.strategies.map((strategy) => (
@@ -55,13 +42,13 @@ export function StrategyRegistryPanel(props: {
               }`}
             >
               <div className="flex items-center justify-between gap-3">
-                <div>
+                <div className="min-w-0">
                   <div className="font-medium text-zinc-100">{strategy.name}</div>
-                  <div className="mt-1 text-sm text-zinc-500">{strategy.description}</div>
+                  <div className="mt-1 line-clamp-2 text-sm text-zinc-500">{strategy.description}</div>
                 </div>
                 <div className="flex items-center gap-2">
                   <Badge variant={strategy.template === "python" ? "success" : "default"}>
-                    {strategy.template === "python" ? TEXT.python : TEXT.template}
+                    {strategy.template === "python" ? "Python" : "模板"}
                   </Badge>
                   <Badge variant={strategy.runtime === "paper" ? "warning" : "default"}>
                     {getRuntimeLabel(strategy.runtime)}
@@ -71,16 +58,19 @@ export function StrategyRegistryPanel(props: {
               <div className="mt-3 flex flex-wrap gap-2 text-xs text-zinc-400">
                 <span>{strategy.symbol}</span>
                 <span>{strategy.interval}</span>
-                <span>{strategy.marketType === "futures" ? TEXT.futures : TEXT.spot}</span>
-                {strategy.artifactSummary?.version && <span>v{strategy.artifactSummary.version}</span>}
+                <span>{strategy.marketType === "futures" ? "合约" : "现货"}</span>
+                {strategy.artifactSummary?.version ? <span>v{strategy.artifactSummary.version}</span> : null}
               </div>
-              {strategy.artifactSummary?.latestSourceFile && (
-                <div className="mt-2 truncate text-xs text-zinc-500">
-                  {TEXT.file}：{strategy.artifactSummary.latestSourceFile}
-                </div>
-              )}
+              {strategy.artifactSummary?.latestSourceFile ? (
+                <div className="mt-2 truncate text-xs text-zinc-500">策略文件：{strategy.artifactSummary.latestSourceFile}</div>
+              ) : null}
             </button>
           ))}
+          {props.strategies.length === 0 ? (
+            <div className="rounded-xl border border-dashed border-zinc-800 bg-zinc-900/30 p-4 text-sm text-zinc-500">
+              还没有策略。先在右侧新建一个 Python 策略并保存到平台。
+            </div>
+          ) : null}
         </div>
       </div>
     </Card>
