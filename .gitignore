@@ -1,0 +1,16 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.codex/
+.env
+.env.local
+docs/api.txt
+python_services/__pycache__/
+python_services/data/
+python_services/strategy_store/
+server/data/
+.env*
+!.env.example

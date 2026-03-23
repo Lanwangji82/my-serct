@@ -1,0 +1,95 @@
+# QuantX trading-focused Clash template
+# This file is intentionally small and biased toward exchange/API stability.
+# Replace the `DIRECT` entries under `AUTO` with your actual low-latency nodes.
+
+mixed-port: 7890
+allow-lan: false
+bind-address: '*'
+mode: rule
+log-level: warning
+external-controller: '127.0.0.1:9090'
+unified-delay: true
+tcp-concurrent: true
+ipv6: false
+
+dns:
+  enable: true
+  ipv6: false
+  respect-rules: true
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  use-hosts: true
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  proxy-server-nameserver:
+    - 'https://dns.alidns.com/dns-query'
+    - 'https://doh.pub/dns-query'
+  nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+  fallback:
+    - 'https://cloudflare-dns.com/dns-query'
+    - 'https://dns.google/dns-query'
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+
+proxy-groups:
+  - { name: PROXY, type: select, proxies: [AUTO, DIRECT] }
+  - { name: AUTO, type: url-test, url: 'https://cp.cloudflare.com/generate_204', interval: 300, tolerance: 50, lazy: true, proxies: [DIRECT] }
+  - { name: AI, type: select, proxies: [PROXY, DIRECT] }
+  - { name: MEDIA, type: select, proxies: [PROXY, DIRECT] }
+
+rules:
+  - 'DOMAIN-SUFFIX,localhost,DIRECT'
+  - 'IP-CIDR,127.0.0.0/8,DIRECT,no-resolve'
+  - 'IP-CIDR,10.0.0.0/8,DIRECT,no-resolve'
+  - 'IP-CIDR,172.16.0.0/12,DIRECT,no-resolve'
+  - 'IP-CIDR,192.168.0.0/16,DIRECT,no-resolve'
+  - 'IP-CIDR,198.18.0.0/16,DIRECT,no-resolve'
+
+  - 'DOMAIN-SUFFIX,binance.com,PROXY'
+  - 'DOMAIN-SUFFIX,binance.info,PROXY'
+  - 'DOMAIN-SUFFIX,binance.vision,PROXY'
+  - 'DOMAIN,api.binance.com,PROXY'
+  - 'DOMAIN,api-gcp.binance.com,PROXY'
+  - 'DOMAIN,api1.binance.com,PROXY'
+  - 'DOMAIN,api2.binance.com,PROXY'
+  - 'DOMAIN,api3.binance.com,PROXY'
+  - 'DOMAIN,fapi.binance.com,PROXY'
+  - 'DOMAIN,fapi1.binance.com,PROXY'
+  - 'DOMAIN,fapi2.binance.com,PROXY'
+  - 'DOMAIN,dapi.binance.com,PROXY'
+  - 'DOMAIN,stream.binance.com,PROXY'
+  - 'DOMAIN,fstream.binance.com,PROXY'
+  - 'DOMAIN,data-api.binance.vision,PROXY'
+  - 'DOMAIN,testnet.binance.vision,PROXY'
+
+  - 'DOMAIN-SUFFIX,okx.com,PROXY'
+  - 'DOMAIN-SUFFIX,okex.com,PROXY'
+  - 'DOMAIN,www.okx.com,PROXY'
+  - 'DOMAIN,ws.okx.com,PROXY'
+  - 'DOMAIN,aws.okx.com,PROXY'
+
+  - 'DOMAIN-KEYWORD,openai,AI'
+  - 'DOMAIN-SUFFIX,chatgpt.com,AI'
+  - 'DOMAIN-SUFFIX,openai.com,AI'
+  - 'DOMAIN-SUFFIX,oaistatic.com,AI'
+  - 'DOMAIN-SUFFIX,oaiusercontent.com,AI'
+  - 'DOMAIN-SUFFIX,anthropic.com,AI'
+  - 'DOMAIN-SUFFIX,claude.ai,AI'
+  - 'DOMAIN-SUFFIX,claude.com,AI'
+  - 'DOMAIN-SUFFIX,googleapis.com,AI'
+  - 'DOMAIN-SUFFIX,googleapis.cn,AI'
+  - 'DOMAIN-SUFFIX,gemini.google.com,AI'
+
+  - 'DOMAIN-SUFFIX,netflix.com,MEDIA'
+  - 'DOMAIN-SUFFIX,netflix.net,MEDIA'
+  - 'DOMAIN-SUFFIX,nflxvideo.net,MEDIA'
+  - 'DOMAIN-SUFFIX,disneyplus.com,MEDIA'
+  - 'DOMAIN-SUFFIX,hbomax.com,MEDIA'
+  - 'DOMAIN-SUFFIX,spotify.com,MEDIA'
+  - 'DOMAIN-SUFFIX,tiktok.com,MEDIA'
+
+  - 'MATCH,DIRECT'
