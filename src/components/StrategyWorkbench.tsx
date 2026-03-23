@@ -6,8 +6,8 @@ import { PythonStrategy, PythonStrategyEditorPanel } from "./PythonStrategyEdito
 import { StrategyRegistryPanel } from "./StrategyRegistryPanel";
 import {
   authorizedFetch,
-  BrokerRegistrySummary,
-  BrokerTarget,
+  type BrokerRegistrySummary,
+  type BrokerTarget,
   getBrokerTargetLabel,
   getRuntimeExecutionTarget,
   PLATFORM_API_BASE,
@@ -34,7 +34,7 @@ type BacktestRun = {
     endingEquity: number;
   };
   equityCurve?: Array<{ time: number; equity: number }>;
-  trades?: Array<{ side: string; price: number; quantity: number; pnl?: number }>;
+  trades?: Array<{ time: number; side: string; price: number; quantity: number; pnl?: number }>;
   completedAt: number;
 };
 
@@ -86,7 +86,7 @@ export function StrategyWorkbench() {
   const [apiSecret, setApiSecret] = useState("");
   const [apiPassphrase, setApiPassphrase] = useState("");
   const [connectivity, setConnectivity] = useState<ConnectivityStatus>(null);
-  const [status, setStatus] = useState("正在连接本地策略工作台。");
+  const [status, setStatus] = useState("正在连接本地策略工作台...");
   const [busy, setBusy] = useState(false);
   const [backtestConfig, setBacktestConfig] = useState<BacktestConfig>({
     lookback: 500,
@@ -139,13 +139,13 @@ export function StrategyWorkbench() {
         || nextBrokers.flatMap((item) => item.targets).find((item) => item.mode === "sandbox")?.target
         || nextBrokers.flatMap((item) => item.targets)[0]?.target
         || ""
-      )
+      ),
     );
   };
 
   useEffect(() => {
     void loadWorkspace().catch((error) => {
-      setStatus(error instanceof Error ? error.message : "加载工作台失败。");
+      setStatus(error instanceof Error ? error.message : "加载工作台失败");
     });
   }, []);
 
@@ -166,17 +166,19 @@ export function StrategyWorkbench() {
       setApiKey("");
       setApiSecret("");
       setApiPassphrase("");
-      setStatus(`已将 ${getBrokerTargetLabel(credentialTarget, brokers)} 的凭证保存到服务端密钥库。`);
+      setStatus(`已保存 ${getBrokerTargetLabel(credentialTarget, brokers)} 的凭证`);
       await loadWorkspace();
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "保存凭证失败。");
+      setStatus(error instanceof Error ? error.message : "保存凭证失败");
     } finally {
       setBusy(false);
     }
   };
 
   const handleRunBacktest = async () => {
-    if (!selectedStrategy) return;
+    if (!selectedStrategy) {
+      return;
+    }
 
     setBusy(true);
     try {
@@ -191,12 +193,10 @@ export function StrategyWorkbench() {
         }),
       });
       setBacktests((prev) => [run, ...prev.filter((item) => item.id !== run.id)]);
-      setStatus(
-        `回测完成：收益率 ${run.metrics.totalReturnPct.toFixed(2)}%，最大回撤 ${run.metrics.maxDrawdownPct.toFixed(2)}%，交易 ${run.metrics.trades} 次。`
-      );
+      setStatus(`回测完成：收益率 ${run.metrics.totalReturnPct.toFixed(2)}%，最大回撤 ${run.metrics.maxDrawdownPct.toFixed(2)}%，交易 ${run.metrics.trades} 次`);
       await loadWorkspace();
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "回测失败。");
+      setStatus(error instanceof Error ? error.message : "回测失败");
     } finally {
       setBusy(false);
     }
@@ -207,7 +207,7 @@ export function StrategyWorkbench() {
       method: "POST",
       body: JSON.stringify({ sourceCode }),
     });
-    setStatus(result.valid ? "Python 策略编译通过。" : "Python 策略编译未通过，请先修复报错。");
+    setStatus(result.valid ? "Python 策略编译通过" : "Python 策略编译未通过，请先修复错误");
     return result;
   };
 
@@ -232,9 +232,9 @@ export function StrategyWorkbench() {
       });
       await loadWorkspace();
       setSelectedStrategyId(saved.id || "");
-      setStatus(`策略“${saved.name}”已保存到平台。`);
+      setStatus(`策略“${saved.name}”已保存到平台`);
     } catch (error: any) {
-      const message = typeof error?.message === "string" ? error.message : "保存策略失败。";
+      const message = typeof error?.message === "string" ? error.message : "保存策略失败";
       setStatus(message);
       throw error;
     } finally {
@@ -243,7 +243,9 @@ export function StrategyWorkbench() {
   };
 
   const handleExecute = async (side: "BUY" | "SELL") => {
-    if (!selectedStrategy) return;
+    if (!selectedStrategy) {
+      return;
+    }
 
     setBusy(true);
     try {
@@ -258,12 +260,12 @@ export function StrategyWorkbench() {
 
       setStatus(
         result.accepted
-          ? `执行请求已通过，已发送到 ${result.broker || result.brokerTarget}。`
-          : `执行被拒绝：${(result.risk?.breaches || []).join(", ")}`
+          ? `执行请求已通过，已发送到 ${result.broker || result.brokerTarget}`
+          : `执行被拒绝：${(result.risk?.breaches || []).join(", ")}`,
       );
       await loadWorkspace();
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : "执行失败。");
+      setStatus(error instanceof Error ? error.message : "执行失败");
     } finally {
       setBusy(false);
     }
@@ -275,7 +277,7 @@ export function StrategyWorkbench() {
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-zinc-50">策略工作流</h1>
           <p className="mt-1 text-sm text-zinc-500">
-            在一个工作流里完成策略编写、参数管理、回测验证和执行准备。
+            在一个工作流里完成策略编写、参数管理、回测验证、凭证维护和执行准备。
           </p>
         </div>
         {user && <Badge variant="success">{user.email}</Badge>}
@@ -331,9 +333,7 @@ export function StrategyWorkbench() {
         onExecute={handleExecute}
       />
 
-      <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 px-4 py-3 text-sm text-zinc-400">
-        {status}
-      </div>
+      <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 px-4 py-3 text-sm text-zinc-400">{status}</div>
     </div>
   );
 }

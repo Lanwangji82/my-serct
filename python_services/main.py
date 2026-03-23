@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import time
+import urllib.request
 from pathlib import Path
 from threading import Lock
 from typing import Any, Literal
@@ -22,6 +23,26 @@ from cryptography.fernet import Fernet
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+
+def load_local_env() -> None:
+    root = Path(__file__).resolve().parent.parent
+    for filename in (".env", ".env.local"):
+        env_path = root / filename
+        if not env_path.exists():
+            continue
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("'").strip('"')
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+load_local_env()
 
 
 APP_PORT = int(os.getenv("PY_PLATFORM_PORT", "8800"))
@@ -170,6 +191,41 @@ def generate_signals(frame: pl.DataFrame, params: dict) -> dict:
 
     return {"entries": entries, "exits": exits}
 """
+
+DEFAULT_STRATEGIES = [
+    {
+        "name": "BTC 双均线趋势",
+        "description": "使用快慢均线交叉识别趋势方向，适合先做回测和纸面验证。",
+        "marketType": "futures",
+        "symbol": "BTCUSDT",
+        "interval": "1h",
+        "runtime": "sandbox",
+        "template": "smaCross",
+        "parameters": {"fastPeriod": 20, "slowPeriod": 50, "positionSizeUsd": 1500},
+        "risk": {
+            "maxNotional": 5000,
+            "maxLeverage": 3,
+            "maxDailyLoss": 400,
+            "allowedSymbols": ["BTCUSDT", "ETHUSDT"],
+        },
+    },
+    {
+        "name": "ETH 突破模板",
+        "description": "基于突破窗口寻找入场信号，适合验证仓位控制和止盈止损参数。",
+        "marketType": "spot",
+        "symbol": "ETHUSDT",
+        "interval": "4h",
+        "runtime": "paper",
+        "template": "breakout",
+        "parameters": {"breakoutLookback": 20, "positionSizeUsd": 1000, "stopLossPct": 2, "takeProfitPct": 4},
+        "risk": {
+            "maxNotional": 3000,
+            "maxLeverage": 1,
+            "maxDailyLoss": 250,
+            "allowedSymbols": ["ETHUSDT"],
+        },
+    },
+]
 
 
 BROKER_SUMMARIES = [
@@ -481,25 +537,67 @@ def to_compact_symbol(symbol: str) -> str:
     return symbol.upper().replace("/", "").replace(":USDT", "").replace("-SWAP", "")
 
 
-def build_ccxt_proxy_config() -> dict[str, Any]:
-    http_proxy = os.getenv("CCXT_HTTP_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
-    https_proxy = os.getenv("CCXT_HTTPS_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY")
-    socks_proxy = os.getenv("CCXT_SOCKS_PROXY") or os.getenv("ALL_PROXY")
-    ws_proxy = os.getenv("CCXT_WS_PROXY")
-    wss_proxy = os.getenv("CCXT_WSS_PROXY")
+def get_proxy_environment() -> dict[str, str]:
+    explicit_http = (os.getenv("CCXT_HTTP_PROXY") or os.getenv("HTTP_PROXY") or "").strip()
+    explicit_https = (os.getenv("CCXT_HTTPS_PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
+    explicit_socks = (os.getenv("CCXT_SOCKS_PROXY") or os.getenv("ALL_PROXY") or "").strip()
+    system_proxies = urllib.request.getproxies()
 
+    return {
+        "httpProxy": explicit_http or str(system_proxies.get("http") or "").strip(),
+        "httpsProxy": explicit_https or str(system_proxies.get("https") or "").strip(),
+        "socksProxy": explicit_socks,
+        "wsProxy": (os.getenv("CCXT_WS_PROXY") or "").strip(),
+        "wssProxy": (os.getenv("CCXT_WSS_PROXY") or "").strip(),
+        "proxySource": "explicit" if any((explicit_http, explicit_https, explicit_socks)) else ("system" if system_proxies else "none"),
+    }
+
+
+def build_ccxt_proxy_config() -> dict[str, Any]:
+    raw_proxy = get_proxy_environment()
     proxy_config: dict[str, Any] = {}
-    if http_proxy:
-        proxy_config["httpProxy"] = http_proxy
-    if https_proxy:
-        proxy_config["httpsProxy"] = https_proxy
-    if socks_proxy:
-        proxy_config["socksProxy"] = socks_proxy
-    if ws_proxy:
-        proxy_config["wsProxy"] = ws_proxy
-    if wss_proxy:
-        proxy_config["wssProxy"] = wss_proxy
+
+    # ccxt only accepts one primary transport proxy at a time.
+    if raw_proxy["socksProxy"]:
+        proxy_config["socksProxy"] = raw_proxy["socksProxy"]
+    elif raw_proxy["httpsProxy"]:
+        proxy_config["httpsProxy"] = raw_proxy["httpsProxy"]
+    elif raw_proxy["httpProxy"]:
+        proxy_config["httpProxy"] = raw_proxy["httpProxy"]
+
+    if raw_proxy["wssProxy"]:
+        proxy_config["wssProxy"] = raw_proxy["wssProxy"]
+    elif raw_proxy["wsProxy"]:
+        proxy_config["wsProxy"] = raw_proxy["wsProxy"]
+
     return proxy_config
+
+
+def get_proxy_runtime_summary() -> dict[str, Any]:
+    raw_proxy = get_proxy_environment()
+    active_mode = "none"
+    active_value = ""
+    if raw_proxy["socksProxy"]:
+        active_mode = "socks"
+        active_value = raw_proxy["socksProxy"]
+    elif raw_proxy["httpsProxy"]:
+        active_mode = "https"
+        active_value = raw_proxy["httpsProxy"]
+    elif raw_proxy["httpProxy"]:
+        active_mode = "http"
+        active_value = raw_proxy["httpProxy"]
+
+    return {
+        "configured": active_mode != "none",
+        "mode": active_mode,
+        "activeProxy": active_value,
+        "source": raw_proxy.get("proxySource", "none"),
+        "httpProxy": raw_proxy["httpProxy"],
+        "httpsProxy": raw_proxy["httpsProxy"],
+        "socksProxy": raw_proxy["socksProxy"],
+        "wsProxy": raw_proxy["wsProxy"],
+        "wssProxy": raw_proxy["wssProxy"],
+    }
 
 
 def create_exchange_client(broker_id: str, market_type: str, credentials: dict[str, str] | None = None, broker_mode: str = "sandbox"):
@@ -513,18 +611,37 @@ def create_exchange_client(broker_id: str, market_type: str, credentials: dict[s
             common["password"] = credentials.get("passphrase") or os.getenv("OKX_API_PASSPHRASE", "")
         common["options"] = {"defaultType": "spot" if market_type == "spot" else "swap"}
         client = ccxt.okx(common)
+        client.session.trust_env = True
         if broker_mode != "production":
             client.set_sandbox_mode(True)
         return client
     if market_type == "spot":
         client = ccxt.binance(common)
+        client.session.trust_env = True
         if broker_mode != "production":
             client.set_sandbox_mode(True)
         return client
     client = ccxt.binanceusdm(common)
+    client.session.trust_env = True
     if broker_mode != "production":
         client.set_sandbox_mode(True)
     return client
+
+
+def measure_broker_latency(broker_target: str, market_type: str = "futures") -> dict[str, Any]:
+    broker_id, broker_mode, normalized = parse_broker_target(broker_target)
+    started_at = now_ms()
+    started_perf = time.perf_counter()
+    client = create_exchange_client(broker_id, market_type, broker_mode=broker_mode)
+    remote_time = client.fetch_time()
+    latency_ms = round((time.perf_counter() - started_perf) * 1000, 2)
+    return {
+        "brokerTarget": normalized,
+        "ok": True,
+        "latencyMs": latency_ms,
+        "remoteTime": remote_time,
+        "checkedAt": started_at,
+    }
 
 
 def resolve_market_symbol(client: Any, broker_id: str, market_type: str, compact_symbol: str) -> str:
@@ -790,6 +907,29 @@ def compile_python_strategy(source_code: str) -> dict[str, Any]:
     except Exception as exc:
         errors.append(str(exc))
     return {"valid": not errors, "errors": errors, "warnings": warnings, "functions": function_names}
+
+
+def compile_python_strategy(source_code: str) -> dict[str, Any]:
+    errors: list[str] = []
+    warnings: list[str] = []
+    function_names: list[str] = []
+    if not source_code.strip():
+        return {"valid": False, "errors": ["策略源码不能为空"], "warnings": warnings, "functions": function_names}
+    try:
+        tree = ast.parse(source_code, filename="<strategy>")
+        compile(source_code, "<strategy>", "exec")
+        function_names = [node.name for node in tree.body if isinstance(node, ast.FunctionDef)]
+        if "generate_signals" not in function_names:
+            errors.append("必须定义 generate_signals(frame, params) 函数")
+        if not any(isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom) for node in tree.body):
+            warnings.append("没有检测到 import 语句，通常建议显式导入 polars")
+    except SyntaxError as exc:
+        errors.append(f"第 {exc.lineno} 行语法错误：{exc.msg}")
+    except Exception as exc:
+        errors.append(str(exc))
+    return {"valid": not errors, "errors": errors, "warnings": warnings, "functions": function_names}
+
+
 class LoginRequest(BaseModel):
     email: str
     password: str
@@ -932,31 +1072,50 @@ def run_backtest(payload: BacktestRequest, authorization: str | None = Header(de
 @app.get("/api/platform/runtime/connectivity")
 def runtime_connectivity(authorization: str | None = Header(default=None)):
     require_user(authorization)
-    http_proxy = os.getenv("CCXT_HTTP_PROXY") or os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or ""
-    socks_proxy = os.getenv("CCXT_SOCKS_PROXY") or os.getenv("ALL_PROXY") or ""
+    proxy_summary = get_proxy_runtime_summary()
     broker_checks: list[dict[str, Any]] = []
     for broker_target in ("okx:sandbox", "binance:sandbox"):
-        broker_id, broker_mode, normalized = parse_broker_target(broker_target)
         try:
-            client = create_exchange_client(broker_id, "futures", broker_mode=broker_mode)
-            broker_checks.append({
-                "brokerTarget": normalized,
-                "ok": True,
-                "remoteTime": client.fetch_time(),
-            })
+            broker_checks.append(measure_broker_latency(broker_target))
         except Exception as exc:
+            _, _, normalized = parse_broker_target(broker_target)
             broker_checks.append({
                 "brokerTarget": normalized,
                 "ok": False,
                 "error": str(exc),
+                "checkedAt": now_ms(),
             })
     return {
-        "proxy": {
-            "configured": bool(http_proxy or socks_proxy),
-            "httpProxy": http_proxy,
-            "socksProxy": socks_proxy,
-        },
+        "proxy": proxy_summary,
         "brokers": broker_checks,
+        "checkedAt": now_ms(),
+    }
+
+
+@app.get("/api/platform/runtime/latency")
+def runtime_latency_test(brokerTarget: str, authorization: str | None = Header(default=None)):
+    require_user(authorization)
+    try:
+        return measure_broker_latency(brokerTarget)
+    except Exception as exc:
+        _, _, normalized = parse_broker_target(brokerTarget)
+        return {
+            "brokerTarget": normalized,
+            "ok": False,
+            "error": str(exc),
+            "checkedAt": now_ms(),
+        }
+
+
+@app.get("/api/platform/runtime/config")
+def runtime_config(authorization: str | None = Header(default=None)):
+    require_user(authorization)
+    return {
+        "appPort": APP_PORT,
+        "localMode": DEV_LOCAL_MODE,
+        "databasePath": str(DB_PATH),
+        "strategyStoreRoot": str(STRATEGY_STORE_ROOT),
+        "proxy": get_proxy_runtime_summary(),
         "checkedAt": now_ms(),
     }
 

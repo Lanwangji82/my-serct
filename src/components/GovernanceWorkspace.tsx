@@ -1,6 +1,13 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { Badge, Button, Card } from "./ui";
-import { authorizedFetch, BrokerRegistrySummary, formatDateTime, getBrokerTargetLabel, GOVERNANCE_API_BASE, PLATFORM_API_BASE } from "../lib/platform-client";
+import { Badge, Button, Card, Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./ui";
+import {
+  authorizedFetch,
+  formatDateTime,
+  getBrokerTargetLabel,
+  GOVERNANCE_API_BASE,
+  PLATFORM_API_BASE,
+  type BrokerRegistrySummary,
+} from "../lib/platform-client";
 
 type ModuleSummary = {
   id: string;
@@ -28,13 +35,15 @@ export function GovernanceWorkspace() {
   const [brokers, setBrokers] = useState<BrokerRegistrySummary[]>([]);
   const [credentials, setCredentials] = useState<CredentialSummary[]>([]);
   const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
-  const [credentialTarget, setCredentialTarget] = useState<string>("");
+  const [credentialTarget, setCredentialTarget] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
-  const [status, setStatus] = useState("正在连接本地治理服务。");
+  const [apiPassphrase, setApiPassphrase] = useState("");
+  const [status, setStatus] = useState("正在连接治理服务...");
   const [busy, setBusy] = useState(false);
 
   const credentialOptions = useMemo(() => brokers.flatMap((item) => item.targets), [brokers]);
+  const needsPassphrase = credentialTarget.startsWith("okx:");
 
   useEffect(() => {
     void (async () => {
@@ -51,8 +60,12 @@ export function GovernanceWorkspace() {
         setBrokers(nextBrokers);
         setCredentials(nextCredentials);
         setAuditEvents(nextAudit);
-        setCredentialTarget((current) => current || nextBrokers.flatMap((item) => item.targets).find((item) => item.mode === "sandbox")?.target || nextBrokers.flatMap((item) => item.targets)[0]?.target || "");
-        setStatus("治理服务已连接。");
+        setCredentialTarget(
+          nextBrokers.flatMap((item) => item.targets).find((item) => item.mode === "sandbox")?.target
+          || nextBrokers.flatMap((item) => item.targets)[0]?.target
+          || "",
+        );
+        setStatus("治理服务已连接");
       } catch (error) {
         setStatus(error instanceof Error ? error.message : "加载治理服务失败");
       }
@@ -60,22 +73,26 @@ export function GovernanceWorkspace() {
   }, []);
 
   const handleSaveCredential = async () => {
-    if (!credentialTarget) return;
+    if (!credentialTarget) {
+      return;
+    }
     setBusy(true);
     try {
       const nextCredentials = await authorizedFetch<CredentialSummary[]>(`${GOVERNANCE_API_BASE}/credentials`, "", {
         method: "POST",
         body: JSON.stringify({
           brokerTarget: credentialTarget,
-          label: getBrokerTargetLabel(credentialTarget as string, brokers),
+          label: getBrokerTargetLabel(credentialTarget, brokers),
           apiKey,
           apiSecret,
+          apiPassphrase: apiPassphrase,
         }),
       });
       setCredentials(nextCredentials);
       setApiKey("");
       setApiSecret("");
-      setStatus(`已保存 ${getBrokerTargetLabel(credentialTarget, brokers)} 的凭证。`);
+      setApiPassphrase("");
+      setStatus(`已保存 ${getBrokerTargetLabel(credentialTarget, brokers)} 的凭证`);
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "保存凭证失败");
     } finally {
@@ -87,77 +104,95 @@ export function GovernanceWorkspace() {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight text-zinc-50">治理服务</h1>
-          <p className="mt-1 text-sm text-zinc-500">凭证、审计轨迹与券商控制能力现在都由治理边界提供。</p>
+          <h1 className="text-2xl font-bold tracking-tight text-zinc-50">治理与凭证</h1>
+          <p className="mt-1 text-sm text-zinc-500">
+            这里负责券商接入、密钥保存和审计日志。对于团队协作，这一页应该是风控和管理员最常检查的地方。
+          </p>
         </div>
         {user && <Badge variant="success">{user.email}</Badge>}
       </div>
 
-      <>
-          <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-            {modules.map((module) => (
-              <Card key={module.id} className="border-zinc-800 bg-zinc-950/85">
-                <div className="p-6">
-                  <div className="text-sm font-medium text-zinc-100">{module.label}</div>
-                  <div className="mt-3 space-y-2 text-sm text-zinc-400">
-                    {module.capabilities.map((capability) => <div key={capability}>{capability}</div>)}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
+        <Card className="border-zinc-800 bg-zinc-950/85"><div className="space-y-2 p-5"><div className="text-xs uppercase tracking-[0.18em] text-zinc-500">治理模块</div><div className="text-2xl font-semibold text-zinc-50">{modules.length}</div><div className="text-sm text-zinc-500">平台已接入的治理能力</div></div></Card>
+        <Card className="border-zinc-800 bg-zinc-950/85"><div className="space-y-2 p-5"><div className="text-xs uppercase tracking-[0.18em] text-zinc-500">凭证数量</div><div className="text-2xl font-semibold text-zinc-50">{credentials.length}</div><div className="text-sm text-zinc-500">已存入密钥库的券商目标</div></div></Card>
+        <Card className="border-zinc-800 bg-zinc-950/85"><div className="space-y-2 p-5"><div className="text-xs uppercase tracking-[0.18em] text-zinc-500">审计事件</div><div className="text-2xl font-semibold text-zinc-50">{auditEvents.length}</div><div className="text-sm text-zinc-500">登录、回测、执行等行为都会入库</div></div></Card>
+      </div>
+
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[0.95fr_1.05fr]">
+        <Card className="border-zinc-800 bg-zinc-950/85">
+          <div className="space-y-5 p-6">
+            <div>
+              <h2 className="text-lg font-semibold text-zinc-100">保存券商凭证</h2>
+              <p className="mt-1 text-sm text-zinc-500">优先把沙盒或模拟盘凭证接进来，确认联通和权限后再考虑生产环境。</p>
+            </div>
+
+            <div className="space-y-3">
+              <select value={credentialTarget} onChange={(e) => setCredentialTarget(e.target.value)} className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white">
+                {credentialOptions.map((item) => (
+                  <option key={item.target} value={item.target}>{item.label}</option>
+                ))}
+              </select>
+              <input value={apiKey} onChange={(e) => setApiKey(e.target.value)} className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white" placeholder="券商 API Key" />
+              <input value={apiSecret} onChange={(e) => setApiSecret(e.target.value)} type="password" className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white" placeholder="券商 API Secret" />
+              {needsPassphrase ? (
+                <input value={apiPassphrase} onChange={(e) => setApiPassphrase(e.target.value)} type="password" className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white" placeholder="OKX API Passphrase" />
+              ) : null}
+              <Button onClick={handleSaveCredential} disabled={busy || !apiKey || !apiSecret || (needsPassphrase && !apiPassphrase)}>
+                保存到密钥库
+              </Button>
+            </div>
+
+            <div className="space-y-3">
+              <div className="text-sm font-medium text-zinc-100">已存凭证</div>
+              {credentials.map((item) => (
+                <div key={item.id} className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <span className="text-zinc-100">{item.label}</span>
+                    <Badge variant="default">{item.brokerTarget}</Badge>
                   </div>
+                  <div className="mt-2 text-xs text-zinc-500">最近更新：{formatDateTime(item.updatedAt)}</div>
                 </div>
-              </Card>
+              ))}
+              {credentials.length === 0 ? <div className="text-sm text-zinc-500">还没有保存任何券商凭证。</div> : null}
+            </div>
+          </div>
+        </Card>
+
+        <Card className="border-zinc-800 bg-zinc-950/85">
+          <div className="space-y-4 p-6">
+            <h2 className="text-lg font-semibold text-zinc-100">治理台账</h2>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>时间</TableHead>
+                  <TableHead>事件</TableHead>
+                  <TableHead>摘要</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {auditEvents.slice(0, 20).map((event) => (
+                  <TableRow key={event.id}>
+                    <TableCell>{formatDateTime(event.createdAt)}</TableCell>
+                    <TableCell>{event.type}</TableCell>
+                    <TableCell className="text-zinc-400">{JSON.stringify(event.payload)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        </Card>
+      </div>
+
+      <Card className="border-zinc-800 bg-zinc-950/85">
+        <div className="space-y-4 p-6">
+          <h2 className="text-lg font-semibold text-zinc-100">已接入券商目标</h2>
+          <div className="flex flex-wrap gap-2">
+            {brokers.flatMap((broker) => broker.targets).map((target) => (
+              <Badge key={target.target} variant="default">{target.label}</Badge>
             ))}
           </div>
-
-          <div className="grid grid-cols-1 gap-6 xl:grid-cols-[0.95fr_1.05fr]">
-            <Card className="border-zinc-800 bg-zinc-950/85">
-              <div className="space-y-5 p-6">
-                <div>
-                  <h2 className="text-lg font-semibold text-zinc-100">券商凭证</h2>
-                  <p className="mt-1 text-sm text-zinc-500">将凭证保存到注册表发现的券商目标中。</p>
-                </div>
-                <div className="grid grid-cols-1 gap-3">
-                  <select value={credentialTarget} onChange={(e) => setCredentialTarget(e.target.value)} className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white">
-                    {credentialOptions.map((item) => (
-                      <option key={item.target} value={item.target}>{item.label}</option>
-                    ))}
-                  </select>
-                  <input value={apiKey} onChange={(e) => setApiKey(e.target.value)} className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white" placeholder="券商 API Key" />
-                  <input value={apiSecret} onChange={(e) => setApiSecret(e.target.value)} type="password" className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white" placeholder="券商 API Secret" />
-                  <Button onClick={handleSaveCredential} disabled={busy || !apiKey || !apiSecret || !credentialTarget}>保存到密钥库</Button>
-                </div>
-                <div className="rounded-xl border border-zinc-800 bg-zinc-900/50 p-4">
-                  <div className="mb-2 text-sm font-medium text-zinc-100">已存凭证</div>
-                  <div className="space-y-2 text-sm text-zinc-400">
-                    {credentials.length === 0 ? <div>还没有保存任何凭证。</div> : credentials.map((item) => (
-                      <div key={item.id} className="flex items-center justify-between gap-3">
-                        <span>{item.label}</span>
-                        <span>{item.brokerTarget}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              </div>
-            </Card>
-
-            <Card className="border-zinc-800 bg-zinc-950/85">
-              <div className="p-6">
-                <div className="mb-4 flex items-center justify-between">
-                  <h2 className="text-lg font-semibold text-zinc-100">审计轨迹</h2>
-                  <Badge variant="warning">{auditEvents.length} 条事件</Badge>
-                </div>
-                <div className="space-y-3">
-                  {auditEvents.slice(0, 10).map((event) => (
-                    <div key={event.id} className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
-                      <div className="flex items-center justify-between gap-3">
-                        <span className="text-zinc-200">{event.type}</span>
-                        <span className="text-xs text-zinc-500">{formatDateTime(event.createdAt)}</span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
-            </Card>
-          </div>
-      </>
+        </div>
+      </Card>
 
       <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 px-4 py-3 text-sm text-zinc-400">{status}</div>
     </div>

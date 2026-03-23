@@ -21,6 +21,15 @@ export function formatDateTime(value: number) {
   return new Date(value).toLocaleString("zh-CN");
 }
 
+export function formatMoney(value: number | null | undefined, digits = 2) {
+  return new Intl.NumberFormat("zh-CN", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  }).format(value ?? 0);
+}
+
 export async function authorizedFetch<T>(path: string, token: string, init?: RequestInit): Promise<T> {
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -60,18 +69,10 @@ export function getBrokerTargetLabel(target: string, brokers: BrokerRegistrySumm
 }
 
 export function getRuntimeLabel(runtime: string) {
-  if (runtime === "paper") {
-    return "纸面";
-  }
-  if (runtime === "sandbox") {
-    return "沙盒";
-  }
-  if (runtime === "production") {
-    return "生产";
-  }
-  if (runtime === "backtest-only") {
-    return "仅回测";
-  }
+  if (runtime === "paper") return "纸面";
+  if (runtime === "sandbox") return "沙盒";
+  if (runtime === "production") return "生产";
+  if (runtime === "backtest-only") return "仅回测";
   return runtime;
 }
 
