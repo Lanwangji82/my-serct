@@ -18,7 +18,12 @@ const MAX_EVENTS = 200;
 const events: CcxtTelemetryEvent[] = [];
 
 function getProxyLabel() {
-  const explicit = process.env.CCXT_HTTP_PROXY
+  const explicit = process.env.PLATFORM_HTTP_PROXY
+    || process.env.PLATFORM_HTTPS_PROXY
+    || process.env.PLATFORM_SOCKS_PROXY
+    || process.env.PLATFORM_WS_PROXY
+    || process.env.PLATFORM_WSS_PROXY
+    || process.env.CCXT_HTTP_PROXY
     || process.env.CCXT_HTTPS_PROXY
     || process.env.CCXT_SOCKS_PROXY
     || process.env.CCXT_WS_PROXY

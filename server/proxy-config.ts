@@ -18,11 +18,11 @@ function firstNonEmpty(...values: Array<string | undefined>) {
 }
 
 export function getCcxtProxyOptions(): CcxtProxyOptions {
-  const httpProxy = firstNonEmpty(process.env.CCXT_HTTP_PROXY, process.env.HTTP_PROXY);
-  const httpsProxy = firstNonEmpty(process.env.CCXT_HTTPS_PROXY, process.env.HTTPS_PROXY, httpProxy);
-  const socksProxy = firstNonEmpty(process.env.CCXT_SOCKS_PROXY, process.env.ALL_PROXY);
-  const wsProxy = firstNonEmpty(process.env.CCXT_WS_PROXY, httpProxy, socksProxy);
-  const wssProxy = firstNonEmpty(process.env.CCXT_WSS_PROXY, httpsProxy, socksProxy, wsProxy);
+  const httpProxy = firstNonEmpty(process.env.PLATFORM_HTTP_PROXY, process.env.CCXT_HTTP_PROXY, process.env.HTTP_PROXY);
+  const httpsProxy = firstNonEmpty(process.env.PLATFORM_HTTPS_PROXY, process.env.CCXT_HTTPS_PROXY, process.env.HTTPS_PROXY, httpProxy);
+  const socksProxy = firstNonEmpty(process.env.PLATFORM_SOCKS_PROXY, process.env.CCXT_SOCKS_PROXY, process.env.ALL_PROXY);
+  const wsProxy = firstNonEmpty(process.env.PLATFORM_WS_PROXY, process.env.CCXT_WS_PROXY, httpProxy, socksProxy);
+  const wssProxy = firstNonEmpty(process.env.PLATFORM_WSS_PROXY, process.env.CCXT_WSS_PROXY, httpsProxy, socksProxy, wsProxy);
 
   return {
     ...(httpProxy ? { httpProxy } : {}),

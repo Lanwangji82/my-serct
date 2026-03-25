@@ -7,14 +7,13 @@ import os
 import re
 import secrets
 import time
-import urllib.request
-import urllib.error
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock, Thread
 from typing import Any, Literal
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
@@ -974,18 +973,20 @@ def start_backtest_job(run_id: str, actor_user_id: str, strategy: dict[str, Any]
 
 
 def get_proxy_environment() -> dict[str, str]:
-    explicit_http = (os.getenv("CCXT_HTTP_PROXY") or os.getenv("HTTP_PROXY") or "").strip()
-    explicit_https = (os.getenv("CCXT_HTTPS_PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
-    explicit_socks = (os.getenv("CCXT_SOCKS_PROXY") or os.getenv("ALL_PROXY") or "").strip()
-    system_proxies = urllib.request.getproxies()
+    explicit_http = (os.getenv("PLATFORM_HTTP_PROXY") or os.getenv("CCXT_HTTP_PROXY") or os.getenv("HTTP_PROXY") or "").strip()
+    explicit_https = (os.getenv("PLATFORM_HTTPS_PROXY") or os.getenv("CCXT_HTTPS_PROXY") or os.getenv("HTTPS_PROXY") or "").strip()
+    explicit_socks = (os.getenv("PLATFORM_SOCKS_PROXY") or os.getenv("CCXT_SOCKS_PROXY") or os.getenv("ALL_PROXY") or "").strip()
+    system_http = os.getenv("http_proxy", "").strip()
+    system_https = os.getenv("https_proxy", "").strip()
+    system_all = os.getenv("all_proxy", "").strip()
 
     return {
-        "httpProxy": explicit_http or str(system_proxies.get("http") or "").strip(),
-        "httpsProxy": explicit_https or str(system_proxies.get("https") or "").strip(),
-        "socksProxy": explicit_socks,
-        "wsProxy": (os.getenv("CCXT_WS_PROXY") or "").strip(),
-        "wssProxy": (os.getenv("CCXT_WSS_PROXY") or "").strip(),
-        "proxySource": "explicit" if any((explicit_http, explicit_https, explicit_socks)) else ("system" if system_proxies else "none"),
+        "httpProxy": explicit_http or system_http,
+        "httpsProxy": explicit_https or system_https,
+        "socksProxy": explicit_socks or system_all,
+        "wsProxy": (os.getenv("PLATFORM_WS_PROXY") or os.getenv("CCXT_WS_PROXY") or "").strip(),
+        "wssProxy": (os.getenv("PLATFORM_WSS_PROXY") or os.getenv("CCXT_WSS_PROXY") or "").strip(),
+        "proxySource": "explicit" if any((explicit_http, explicit_https, explicit_socks)) else ("system" if any((system_http, system_https, system_all)) else "none"),
     }
 
 def get_proxy_runtime_summary() -> dict[str, Any]:
@@ -1015,38 +1016,38 @@ def get_proxy_runtime_summary() -> dict[str, Any]:
     }
 
 
-def build_urllib_opener() -> urllib.request.OpenerDirector:
+def build_httpx_client() -> httpx.Client:
     proxy_env = get_proxy_environment()
-    proxies: dict[str, str] = {}
+    proxy = ""
     if proxy_env["socksProxy"]:
-        proxies["http"] = proxy_env["socksProxy"]
-        proxies["https"] = proxy_env["socksProxy"]
-    else:
-        if proxy_env["httpProxy"]:
-            proxies["http"] = proxy_env["httpProxy"]
-        if proxy_env["httpsProxy"]:
-            proxies["https"] = proxy_env["httpsProxy"]
-    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+        proxy = proxy_env["socksProxy"]
+    elif proxy_env["httpsProxy"]:
+        proxy = proxy_env["httpsProxy"]
+    elif proxy_env["httpProxy"]:
+        proxy = proxy_env["httpProxy"]
 
-
-def fetch_json_via_http(url: str) -> dict[str, Any]:
-    opener = build_urllib_opener()
     timeout_seconds = max(int(os.getenv("PLATFORM_HTTP_TIMEOUT_MS", "10000")) / 1000.0, 1.0)
-    request = urllib.request.Request(
-        url,
+    return httpx.Client(
+        proxy=proxy or None,
+        timeout=httpx.Timeout(timeout_seconds),
+        follow_redirects=True,
         headers={
             "User-Agent": "QuantX/0.1",
             "Accept": "application/json",
         },
     )
+
+
+def fetch_json_via_http(url: str) -> dict[str, Any]:
     try:
-        with opener.open(request, timeout=timeout_seconds) as response:
-            return json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"HTTP {exc.code}: {url}") from exc
-    except urllib.error.URLError as exc:
-        reason = getattr(exc, "reason", exc)
-        raise RuntimeError(f"Network error: {reason}") from exc
+        with build_httpx_client() as client:
+            response = client.get(url)
+            response.raise_for_status()
+            return response.json()
+    except httpx.HTTPStatusError as exc:
+        raise RuntimeError(f"HTTP {exc.response.status_code}: {url}") from exc
+    except httpx.HTTPError as exc:
+        raise RuntimeError(f"Network error: {exc}") from exc
 
 
 BROKER_LATENCY_ENDPOINTS: dict[str, dict[str, str]] = {
