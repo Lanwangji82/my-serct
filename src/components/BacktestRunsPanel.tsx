@@ -468,14 +468,16 @@ function ChartPanel(props: { candles: Candle[]; hovered: Candle | null; onHover:
 export function BacktestRunsPanel(props: {
   selectedStrategy: Strategy | null;
   backtests: BacktestRun[];
+  latestRun: BacktestRun | null;
   busy: boolean;
+  loadingRunDetail?: boolean;
   config: BacktestConfig;
   onConfigChange: (config: BacktestConfig) => void;
   onRunBacktest: () => void;
 }) {
   const [tab, setTab] = useState<"runtime" | "orders" | "market">("runtime");
   const [showAdvanced, setShowAdvanced] = useState(false);
-  const latestRun = props.backtests[0] || null;
+  const latestRun = props.latestRun;
   const active = latestRun?.status === "queued" || latestRun?.status === "running";
   const marketRows = useMemo(
     () => latestRun?.marketRows?.length ? latestRun.marketRows : (latestRun?.equityCurve || []).map((p) => ({ time: p.time, lastPrice: 0, equity: p.equity, events: [] })),

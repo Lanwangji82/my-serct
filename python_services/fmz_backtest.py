@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlencode
 
 
 @dataclass
@@ -372,27 +373,104 @@ def parse_period_to_ms(period: str | None) -> int:
     return value * 60 * 60 * 1000
 
 
-def estimate_record_limit(config: BacktestConfig) -> int:
-    fallback = max(int(config.chart_bars or 0), int(config.candle_limit or 0), 1000)
-    if not config.start_time or not config.end_time:
-        return fallback
-    try:
-        start = datetime.strptime(config.start_time, "%Y-%m-%d %H:%M:%S")
-        end = datetime.strptime(config.end_time, "%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        return fallback
-    window_ms = max(int((end - start).total_seconds() * 1000), 0)
-    period_ms = parse_period_to_ms(config.period)
-    bars = math.ceil(window_ms / period_ms) + 8 if period_ms else fallback
-    return max(fallback, min(max(bars, 64), 10000))
+def decimal_places(value: Any) -> int:
+    text = str(value or "").strip()
+    if not text or text in {"0", "0.0"}:
+        return 0
+    if "e-" in text.lower():
+        try:
+            return max(0, int(text.lower().split("e-")[1]))
+        except (IndexError, ValueError):
+            return 0
+    if "." not in text:
+        return 0
+    return len(text.rstrip("0").split(".", 1)[1])
+
+
+def build_history_query(config: BacktestConfig, period_ms: int) -> tuple[str, dict[str, Any]]:
+    fmz = load_fmz_module()
+    task = fmz.parseTask(build_backtest_header(config))
+    exchange = (task.get("Exchanges") or [{}])[0]
+    options = task.get("Options") or {}
+    history_symbol = to_fmz_symbol(config.symbol)
+    if config.market_type == "futures" and not history_symbol.endswith(".swap"):
+        history_symbol = f"{history_symbol}.swap"
+    start_sec = 0
+    end_sec = 0
+    if config.start_time:
+        try:
+            start_sec = int(datetime.strptime(config.start_time, "%Y-%m-%d %H:%M:%S").timestamp())
+        except ValueError:
+            start_sec = 0
+    if config.end_time:
+        try:
+            end_sec = int(datetime.strptime(config.end_time, "%Y-%m-%d %H:%M:%S").timestamp())
+        except ValueError:
+            end_sec = 0
+    params = {
+        "detail": "true",
+        "round": "true",
+        "feeder": "local",
+        "event": "feed",
+        "symbol": history_symbol,
+        "eid": exchange.get("Id"),
+        "depth": max(int(config.depth_min or 0), 1),
+        "trades": 0,
+        "custom": 0,
+        "period": int(period_ms),
+        "from": start_sec,
+        "to": end_sec,
+    }
+    data_server = str(options.get("DataServer") or getattr(fmz, "DATASERVER", "http://q.fmz.com")).rstrip("/")
+    return f"{data_server}/data/history?{urlencode(params)}", params
+
+
+def normalize_history_rows(payload: dict[str, Any], start_ms: int, end_ms: int) -> list[dict[str, Any]]:
+    detail = payload.get("detail") or {}
+    schema = [str(item).lower() for item in (payload.get("schema") or [])]
+    rows = payload.get("data") or []
+    if not schema or not rows:
+        return []
+
+    field_index = {name: index for index, name in enumerate(schema)}
+    price_scale = 10 ** max(int(detail.get("quotePrecision") or 0), decimal_places(detail.get("priceTick")))
+    volume_scale = 10 ** max(int(detail.get("basePrecision") or 0), decimal_places(detail.get("volumeTick")))
+    open_interest_scale = 10 ** decimal_places(detail.get("openInterestTick"))
+
+    normalized: list[dict[str, Any]] = []
+    for item in rows:
+        if not isinstance(item, list) or not item:
+            continue
+        timestamp = int(item[field_index["time"]]) if "time" in field_index else 0
+        if not timestamp:
+            continue
+        if start_ms and timestamp < start_ms:
+            continue
+        if end_ms and timestamp > end_ms:
+            continue
+
+        def get_scaled(name: str, scale: int) -> float:
+            if name not in field_index:
+                return 0.0
+            raw = float(item[field_index[name]] or 0)
+            return round(raw / scale, 6) if scale > 1 else round(raw, 6)
+
+        normalized.append(
+            {
+                "time": timestamp,
+                "open": get_scaled("open", price_scale),
+                "high": get_scaled("high", price_scale),
+                "low": get_scaled("low", price_scale),
+                "close": get_scaled("close", price_scale),
+                "volume": get_scaled("vol", volume_scale),
+                "openInterest": get_scaled("openinterest", open_interest_scale),
+            }
+        )
+    return normalized
 
 
 def fetch_ohlcv_rows(config: BacktestConfig) -> list[dict[str, Any]]:
-    fmz = load_fmz_module()
-    limit = estimate_record_limit(config)
     period_ms = parse_period_to_ms(config.period)
-    period_seconds = max(1, period_ms // 1000)
-    max_steps = max(limit + 8, 64)
     start_ms = 0
     target_end_ms = 0
     if config.start_time:
@@ -405,67 +483,13 @@ def fetch_ohlcv_rows(config: BacktestConfig) -> list[dict[str, Any]]:
             target_end_ms = int(datetime.strptime(config.end_time, "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
         except ValueError:
             target_end_ms = 0
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".records.json", delete=False) as handle:
-        output_path = Path(handle.name)
-
-    helper_source = "\n".join(
-        [
-            "'''backtest",
-            "placeholder",
-            "'''",
-            "from fmz import *",
-            "import json",
-            "",
-            "def main():",
-            f"    exchange.SetMaxBarLen({limit})",
-            "    records_by_time = {}",
-            f"    for _ in range({max_steps}):",
-            f"        records = exchange.GetRecords('', {period_seconds}, {limit}) or []",
-            "        if records:",
-            "            for item in records:",
-            "                records_by_time[item['Time']] = item",
-            f"            if {target_end_ms} and records[-1]['Time'] >= ({target_end_ms} - {period_ms}):",
-            "                break",
-            f"        Sleep({period_ms})",
-            f"    with open({json.dumps(str(output_path))}, 'w', encoding='utf-8') as handle:",
-            "        json.dump([records_by_time[key] for key in sorted(records_by_time)], handle, ensure_ascii=False)",
-        ]
-    )
-
-    task, _ = build_task(helper_source, config, fmz)
-    backtest = fmz.Backtest(task, fmz.DummySession())
     try:
-        backtest.Run()
-        backtest.ctx.Join(False)
-        if not output_path.exists():
-            return []
-        records = json.loads(output_path.read_text(encoding="utf-8"))
-    finally:
-        output_path.unlink(missing_ok=True)
-
-    rows: list[dict[str, Any]] = []
-    for item in records or []:
-        if not isinstance(item, dict):
-            continue
-        timestamp = int(item.get("Time") or 0)
-        if not timestamp:
-            continue
-        if start_ms and timestamp < start_ms:
-            continue
-        if target_end_ms and timestamp > target_end_ms:
-            continue
-        rows.append(
-            {
-                "time": timestamp,
-                "open": round(float(item.get("Open") or 0), 6),
-                "high": round(float(item.get("High") or 0), 6),
-                "low": round(float(item.get("Low") or 0), 6),
-                "close": round(float(item.get("Close") or 0), 6),
-                "volume": round(float(item.get("Volume") or 0), 6),
-                "openInterest": round(float(item.get("OpenInterest") or 0), 6),
-            }
-        )
-    return rows
+        fmz = load_fmz_module()
+        url, _ = build_history_query(config, period_ms)
+        payload = json.loads(fmz.httpGet(url).decode("utf-8"))
+        return normalize_history_rows(payload, start_ms, target_end_ms)
+    except Exception:
+        return []
 
 
 def build_snapshot_timeline(raw_result: dict[str, Any], initial_capital: float) -> tuple[list[int], list[dict[str, float]]]:

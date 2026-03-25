@@ -9,6 +9,8 @@ import secrets
 import time
 import urllib.request
 import urllib.error
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
 from threading import RLock, Thread
 from typing import Any, Literal
@@ -17,6 +19,16 @@ import uvicorn
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+try:
+    from pymongo import MongoClient
+except ImportError:
+    MongoClient = None  # type: ignore[assignment]
+
+try:
+    import redis
+except ImportError:
+    redis = None  # type: ignore[assignment]
 
 try:
     from .fmz_backtest import BacktestConfig as FmzBacktestConfig
@@ -49,10 +61,17 @@ load_local_env()
 APP_PORT = int(os.getenv("PY_PLATFORM_PORT", "8800"))
 DB_PATH = Path(os.getenv("PY_PLATFORM_DB_PATH", Path(__file__).resolve().parent / "data" / "platform_db.json"))
 STRATEGY_STORE_ROOT = Path(os.getenv("PY_PLATFORM_STRATEGY_STORE", Path(__file__).resolve().parent / "strategy_store"))
+BACKTEST_STORE_ROOT = Path(os.getenv("PY_PLATFORM_BACKTEST_STORE", Path(__file__).resolve().parent / "data" / "backtests"))
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 STRATEGY_STORE_ROOT.mkdir(parents=True, exist_ok=True)
+BACKTEST_STORE_ROOT.mkdir(parents=True, exist_ok=True)
 SESSION_TTL_MS = 1000 * 60 * 60 * 12
 DEV_LOCAL_MODE = os.getenv("PY_PLATFORM_LOCAL_MODE", "1").lower() not in {"0", "false", "off"}
+MONGODB_URI = (os.getenv("MONGODB_URI") or "").strip()
+MONGODB_DB_NAME = (os.getenv("MONGODB_DB_NAME") or "quantx_platform").strip()
+REDIS_URL = (os.getenv("REDIS_URL") or "").strip()
+STORAGE_BACKEND = (os.getenv("PY_PLATFORM_STORAGE_BACKEND") or ("mongo" if MONGODB_URI else "json")).strip().lower()
+CACHE_PREFIX = "quantx:platform:"
 
 BrokerId = Literal["paper", "binance", "okx", "bybit", "ibkr"]
 BrokerMode = Literal["paper", "sandbox", "production"]
@@ -117,12 +136,14 @@ class JsonDb:
     def write(self, state: dict[str, Any]) -> None:
         with self.lock:
             self._write_unlocked(state)
+            invalidate_state_caches()
 
     def update(self, fn):
         with self.lock:
             state = self.read()
             next_state = fn(state)
             self._write_unlocked(next_state)
+            invalidate_state_caches()
             return next_state
 
     def _write_unlocked(self, state: dict[str, Any]) -> None:
@@ -142,8 +163,167 @@ class JsonDb:
         if self.backup_path.exists():
             self.backup_path.replace(self.backup_path.with_suffix(f"{self.backup_path.suffix}.corrupt.{timestamp}"))
 
+class RedisCache:
+    def __init__(self, url: str):
+        self.client = None
+        self.enabled = False
+        if not url or redis is None:
+            return
+        try:
+            self.client = redis.Redis.from_url(url, decode_responses=True)
+            self.client.ping()
+            self.enabled = True
+        except Exception:
+            self.client = None
+            self.enabled = False
 
-db = JsonDb(DB_PATH)
+    def get_json(self, key: str) -> Any | None:
+        if not self.enabled or self.client is None:
+            return None
+        try:
+            payload = self.client.get(CACHE_PREFIX + key)
+            return json.loads(payload) if payload else None
+        except Exception:
+            return None
+
+    def set_json(self, key: str, value: Any, ttl_ms: int) -> None:
+        if not self.enabled or self.client is None:
+            return
+        try:
+            self.client.set(CACHE_PREFIX + key, json.dumps(value, ensure_ascii=False), px=max(ttl_ms, 1))
+        except Exception:
+            pass
+
+    def delete(self, *keys: str) -> None:
+        if not self.enabled or self.client is None or not keys:
+            return
+        try:
+            self.client.delete(*[CACHE_PREFIX + key for key in keys])
+        except Exception:
+            pass
+
+    def clear_prefix(self, prefix: str) -> None:
+        if not self.enabled or self.client is None:
+            return
+        try:
+            for key in self.client.scan_iter(f"{CACHE_PREFIX}{prefix}*"):
+                self.client.delete(key)
+        except Exception:
+            pass
+
+    @contextmanager
+    def lock(self, name: str, timeout: int = 10):
+        if not self.enabled or self.client is None:
+            yield
+            return
+        lock = self.client.lock(CACHE_PREFIX + "lock:" + name, timeout=timeout, blocking_timeout=max(timeout, 1))
+        acquired = False
+        try:
+            acquired = bool(lock.acquire())
+            yield
+        finally:
+            if acquired:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
+
+
+redis_cache = RedisCache(REDIS_URL)
+
+
+def invalidate_state_caches() -> None:
+    redis_cache.clear_prefix("strategies:")
+    redis_cache.clear_prefix("backtests:")
+    redis_cache.clear_prefix("audit:")
+    redis_cache.delete("runtime:connectivity")
+
+
+def cached_json(key: str, ttl_ms: int, loader) -> Any:
+    cached = redis_cache.get_json(key)
+    if cached is not None:
+        return cached
+    value = loader()
+    redis_cache.set_json(key, value, ttl_ms)
+    return value
+
+
+class MongoDb:
+    collection_names = {
+        "users": "users",
+        "sessions": "sessions",
+        "credentials": "credentials",
+        "strategies": "strategies",
+        "backtests": "backtests",
+        "auditEvents": "audit_events",
+        "paperAccounts": "paper_accounts",
+    }
+
+    def __init__(self, uri: str, db_name: str):
+        if MongoClient is None:
+            raise RuntimeError("MongoDB 后端已启用，但未安装 pymongo。")
+        self.client = MongoClient(uri, appname="quantx-platform")
+        self.database = self.client[db_name]
+        self.lock = RLock()
+        self._ensure_indexes()
+
+    @staticmethod
+    def default_state() -> dict[str, Any]:
+        return JsonDb.default_state()
+
+    def _ensure_indexes(self) -> None:
+        self.database["strategies"].create_index("id", unique=True)
+        self.database["strategies"].create_index("updatedAt")
+        self.database["backtests"].create_index("id", unique=True)
+        self.database["backtests"].create_index("strategyId")
+        self.database["backtests"].create_index("startedAt")
+        self.database["audit_events"].create_index("id", unique=True)
+        self.database["audit_events"].create_index([("actorUserId", 1), ("createdAt", -1)])
+        self.database["sessions"].create_index("token", unique=True)
+        self.database["sessions"].create_index("expiresAt")
+        self.database["users"].create_index("id", unique=True)
+        self.database["users"].create_index("email", unique=True)
+
+    def read(self) -> dict[str, Any]:
+        with self.lock:
+            state = self.default_state()
+            for field, collection_name in self.collection_names.items():
+                items = list(self.database[collection_name].find({}, {"_id": 0}))
+                state[field] = items
+            return state
+
+    def write(self, state: dict[str, Any]) -> None:
+        with self.lock, redis_cache.lock("storage-write"):
+            self._write_unlocked(state)
+            invalidate_state_caches()
+
+    def update(self, fn):
+        with self.lock, redis_cache.lock("storage-update"):
+            state = self.read()
+            next_state = fn(state)
+            self._write_unlocked(next_state)
+            invalidate_state_caches()
+            return next_state
+
+    def _write_unlocked(self, state: dict[str, Any]) -> None:
+        for field, collection_name in self.collection_names.items():
+            collection = self.database[collection_name]
+            collection.delete_many({})
+            items = state.get(field) or []
+            if items:
+                collection.insert_many([{**item, "_id": item.get("id") or f"{field}-{index}"} for index, item in enumerate(items)], ordered=False)
+
+
+def create_storage_backend():
+    if STORAGE_BACKEND == "mongo" and MONGODB_URI:
+        try:
+            return MongoDb(MONGODB_URI, MONGODB_DB_NAME)
+        except Exception:
+            pass
+    return JsonDb(DB_PATH)
+
+
+db = create_storage_backend()
 
 
 
@@ -282,6 +462,13 @@ BROKER_SUMMARIES = [
 
 
 app = FastAPI(title="QuantX Python Platform", version="0.1.0")
+BACKTEST_DETAIL_FIELDS = {"equityCurve", "trades", "marketRows", "logs", "assetRows"}
+NON_PERSISTED_BACKTEST_FIELDS = {"rawResult"}
+CONNECTIVITY_CACHE_TTL_MS = 30_000
+_connectivity_cache: dict[str, Any] | None = None
+_connectivity_cache_checked_at = 0
+_connectivity_cache_lock = RLock()
+_backtest_detail_lock = RLock()
 
 
 def looks_corrupted_text(value: Any) -> bool:
@@ -344,11 +531,14 @@ def ensure_bootstrap_user() -> dict[str, Any]:
 
 
 def list_strategies() -> list[dict[str, Any]]:
-    state = db.read()
-    strategies = prune_missing_strategy_artifacts([normalize_strategy_record(item) for item in state["strategies"]])
-    if strategies != state["strategies"]:
-        db.write({**state, "strategies": strategies})
-    return sorted(strategies, key=lambda item: item["updatedAt"], reverse=True)
+    def load() -> list[dict[str, Any]]:
+        state = db.read()
+        strategies = prune_missing_strategy_artifacts([normalize_strategy_record(item) for item in state["strategies"]])
+        if strategies != state["strategies"]:
+            db.write({**state, "strategies": strategies})
+        return sorted(strategies, key=lambda item: item["updatedAt"], reverse=True)
+
+    return cached_json("strategies:list", 3000, load)
 
 
 def get_strategy_summary(strategy: dict[str, Any]) -> dict[str, Any]:
@@ -464,12 +654,154 @@ def audit_event(actor_user_id: str, event_type: str, payload: dict[str, Any]) ->
 
 
 def list_audit_events(user_id: str) -> list[dict[str, Any]]:
-    state = db.read()
-    return sorted([item for item in state["auditEvents"] if item["actorUserId"] == user_id], key=lambda item: item["createdAt"], reverse=True)
+    return cached_json(
+        f"audit:{user_id}",
+        2000,
+        lambda: sorted([item for item in db.read()["auditEvents"] if item["actorUserId"] == user_id], key=lambda item: item["createdAt"], reverse=True),
+    )
 
 
 def backtest_sort_key(item: dict[str, Any]) -> int:
     return int(item.get("completedAt") or item.get("startedAt") or item.get("queuedAt") or 0)
+
+
+def backtest_detail_path(run_id: str) -> Path:
+    return BACKTEST_STORE_ROOT / f"{run_id}.json"
+
+
+def read_backtest_details(run_id: str) -> dict[str, Any]:
+    path = backtest_detail_path(run_id)
+    with _backtest_detail_lock:
+        if not path.exists():
+            return {}
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            path.unlink(missing_ok=True)
+            return {}
+
+
+def write_backtest_details(run_id: str, details: dict[str, Any]) -> None:
+    path = backtest_detail_path(run_id)
+    payload = {key: value for key, value in details.items() if key in BACKTEST_DETAIL_FIELDS}
+    with _backtest_detail_lock:
+        if not any(payload.get(key) for key in BACKTEST_DETAIL_FIELDS):
+            path.unlink(missing_ok=True)
+            return
+        temp_path = path.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(path)
+
+
+def split_backtest_record(item: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    details = {key: item.get(key) for key in BACKTEST_DETAIL_FIELDS if key in item}
+    summary = {
+        key: value
+        for key, value in item.items()
+        if key not in BACKTEST_DETAIL_FIELDS and key not in NON_PERSISTED_BACKTEST_FIELDS
+    }
+    summary["hasDetails"] = any(details.get(key) for key in BACKTEST_DETAIL_FIELDS)
+    summary["detailCounts"] = {
+        "equityCurve": len(details.get("equityCurve") or []),
+        "trades": len(details.get("trades") or []),
+        "marketRows": len(details.get("marketRows") or []),
+        "logs": len(details.get("logs") or []),
+        "assetRows": len(details.get("assetRows") or []),
+    }
+    return summary, details
+
+
+def merge_backtest_record(summary: dict[str, Any]) -> dict[str, Any]:
+    return {**summary, **read_backtest_details(summary["id"])}
+
+
+def strip_backtest_details(item: dict[str, Any]) -> dict[str, Any]:
+    compact = {key: value for key, value in item.items() if key not in BACKTEST_DETAIL_FIELDS}
+    if "detailCounts" not in compact:
+        compact["detailCounts"] = {
+            "equityCurve": len(item.get("equityCurve") or []),
+            "trades": len(item.get("trades") or []),
+            "marketRows": len(item.get("marketRows") or []),
+            "logs": len(item.get("logs") or []),
+            "assetRows": len(item.get("assetRows") or []),
+        }
+    compact["hasDetails"] = bool(compact.get("hasDetails") or any(compact["detailCounts"].values()))
+    return compact
+
+
+def find_backtest_run(run_id: str) -> dict[str, Any] | None:
+    def load() -> dict[str, Any] | None:
+        state = db.read()
+        summary = next((item for item in state["backtests"] if item["id"] == run_id), None)
+        return merge_backtest_record(summary) if summary else None
+
+    return cached_json(f"backtests:detail:{run_id}", 1500, load)
+
+
+def migrate_backtests_to_file_store() -> None:
+    state = db.read()
+    migrated = False
+    summaries: list[dict[str, Any]] = []
+    for item in state["backtests"]:
+        if any(key in item for key in BACKTEST_DETAIL_FIELDS) or any(key in item for key in NON_PERSISTED_BACKTEST_FIELDS) or "detailCounts" not in item:
+            summary, details = split_backtest_record(item)
+            write_backtest_details(summary["id"], details)
+            summaries.append(summary)
+            migrated = True
+        else:
+            summaries.append(item)
+    if migrated:
+        db.write({**state, "backtests": summaries[:200]})
+
+
+def collect_runtime_connectivity() -> dict[str, Any]:
+    proxy_summary = get_proxy_runtime_summary()
+    broker_checks: list[dict[str, Any]] = []
+    broker_targets = ("okx:sandbox", "binance:sandbox", "binance:production", "okx:production")
+    with ThreadPoolExecutor(max_workers=len(broker_targets)) as executor:
+        futures = {executor.submit(measure_broker_latency, broker_target): broker_target for broker_target in broker_targets}
+        for future in as_completed(futures):
+            broker_target = futures[future]
+            try:
+                broker_checks.append(future.result())
+            except Exception as exc:
+                _, _, normalized = parse_broker_target(broker_target)
+                broker_checks.append(
+                    {
+                        "brokerTarget": normalized,
+                        "ok": False,
+                        "error": str(exc),
+                        "checkedAt": now_ms(),
+                    }
+                )
+    broker_checks.sort(key=lambda item: item["brokerTarget"])
+    return {
+        "proxy": proxy_summary,
+        "brokers": broker_checks,
+        "checkedAt": now_ms(),
+    }
+
+
+def get_cached_runtime_connectivity(force_refresh: bool = False) -> dict[str, Any]:
+    global _connectivity_cache, _connectivity_cache_checked_at
+    with _connectivity_cache_lock:
+        current = now_ms()
+        if not force_refresh and _connectivity_cache and current - _connectivity_cache_checked_at < CONNECTIVITY_CACHE_TTL_MS:
+            return _connectivity_cache
+        if not force_refresh:
+            cached = redis_cache.get_json("runtime:connectivity")
+            if cached is not None:
+                _connectivity_cache = cached
+                _connectivity_cache_checked_at = current
+                return cached
+        snapshot = collect_runtime_connectivity()
+        _connectivity_cache = snapshot
+        _connectivity_cache_checked_at = current
+        redis_cache.set_json("runtime:connectivity", snapshot, CONNECTIVITY_CACHE_TTL_MS)
+        return snapshot
+
+
+migrate_backtests_to_file_store()
 
 
 def update_backtest_run(run_id: str, updater):
@@ -477,7 +809,11 @@ def update_backtest_run(run_id: str, updater):
         runs: list[dict[str, Any]] = []
         for item in current["backtests"]:
             if item["id"] == run_id:
-                item = updater(dict(item))
+                merged = merge_backtest_record(item)
+                next_item = updater(dict(merged))
+                summary, details = split_backtest_record(next_item)
+                write_backtest_details(run_id, details)
+                item = summary
             runs.append(item)
         return {**current, "backtests": runs[:200]}
 
@@ -921,11 +1257,42 @@ def build_backtest_contract(payload: BacktestRequest, strategy: dict[str, Any]) 
 
 
 @app.get("/api/platform/backtests")
-def list_backtests(strategyId: str | None = None, authorization: str | None = Header(default=None)):
+def list_backtests(
+    strategyId: str | None = None,
+    includeDetails: bool = False,
+    limit: int = 100,
+    authorization: str | None = Header(default=None),
+):
     require_user(authorization)
-    state = db.read()
-    runs = [item for item in state["backtests"] if not strategyId or item["strategyId"] == strategyId]
-    return sorted(runs, key=backtest_sort_key, reverse=True)
+    cache_key = f"backtests:list:{strategyId or 'all'}:{int(bool(includeDetails))}:{max(1, min(limit, 200))}"
+
+    def load():
+        state = db.read()
+        runs = [item for item in state["backtests"] if not strategyId or item["strategyId"] == strategyId]
+        sorted_runs = sorted(runs, key=backtest_sort_key, reverse=True)[: max(1, min(limit, 200))]
+        if includeDetails:
+            return [merge_backtest_record(item) for item in sorted_runs]
+        return [strip_backtest_details(item) for item in sorted_runs]
+
+    return cached_json(cache_key, 1500, load)
+
+
+@app.get("/api/platform/backtests/{run_id}")
+def get_backtest(run_id: str, authorization: str | None = Header(default=None)):
+    require_user(authorization)
+    run = find_backtest_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="未找到指定回测")
+    return run
+
+
+@app.get("/api/platform/backtests/{run_id}/status")
+def get_backtest_status(run_id: str, authorization: str | None = Header(default=None)):
+    require_user(authorization)
+    run = find_backtest_run(run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="未找到指定回测")
+    return strip_backtest_details(run)
 
 
 @app.post("/api/platform/backtests")
@@ -1021,35 +1388,18 @@ async def run_backtest(payload: BacktestRequest, authorization: str | None = Hea
             "orderMode": payload.orderMode,
         },
     }
-    state = db.read()
-    state["backtests"] = [result, *state["backtests"]][:200]
-    db.write(state)
+    summary, details = split_backtest_record(result)
+    write_backtest_details(summary["id"], details)
+    db.update(lambda current: {**current, "backtests": [summary, *current["backtests"]][:200]})
     audit_event(actor["id"], "backtest.run.queued", {"strategyId": payload.strategyId, "brokerTarget": payload.brokerTarget, "runId": result["id"]})
     start_backtest_job(result["id"], actor["id"], strategy, payload)
-    return result
+    return strip_backtest_details(summary)
 
 
 @app.get("/api/platform/runtime/connectivity")
 def runtime_connectivity(authorization: str | None = Header(default=None)):
     require_user(authorization)
-    proxy_summary = get_proxy_runtime_summary()
-    broker_checks: list[dict[str, Any]] = []
-    for broker_target in ("okx:sandbox", "binance:sandbox", "binance:production", "okx:production"):
-        try:
-            broker_checks.append(measure_broker_latency(broker_target))
-        except Exception as exc:
-            _, _, normalized = parse_broker_target(broker_target)
-            broker_checks.append({
-                "brokerTarget": normalized,
-                "ok": False,
-                "error": str(exc),
-                "checkedAt": now_ms(),
-            })
-    return {
-        "proxy": proxy_summary,
-        "brokers": broker_checks,
-        "checkedAt": now_ms(),
-    }
+    return get_cached_runtime_connectivity()
 
 
 @app.get("/api/platform/runtime/latency")

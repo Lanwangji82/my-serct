@@ -3,7 +3,7 @@ import { BacktestRunsPanel, type BacktestConfig } from "./BacktestRunsPanel";
 import { ExecutionConsolePanel } from "./ExecutionConsolePanel";
 import { StrategyRegistryPanel } from "./StrategyRegistryPanel";
 import { Badge } from "./ui";
-import type { AuditEvent, BacktestRun, ConnectivityStatus, PlatformStrategy } from "./strategy-types";
+import type { BacktestRun, ConnectivityStatus, PlatformStrategy } from "./strategy-types";
 import { authorizedFetch, PLATFORM_API_BASE } from "../lib/platform-client";
 
 type Strategy = PlatformStrategy;
@@ -72,11 +72,12 @@ export function StrategyWorkbench() {
   const [user, setUser] = useState<{ email: string; roles: string[] } | null>(null);
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [backtests, setBacktests] = useState<BacktestRun[]>([]);
-  const [auditEvents, setAuditEvents] = useState<AuditEvent[]>([]);
+  const [backtestDetails, setBacktestDetails] = useState<Record<string, BacktestRun>>({});
   const [selectedStrategyId, setSelectedStrategyId] = useState("");
   const [connectivity, setConnectivity] = useState<ConnectivityStatus>(null);
   const [status, setStatus] = useState("正在连接策略工作台...");
   const [busy, setBusy] = useState(false);
+  const [loadingRunDetail, setLoadingRunDetail] = useState(false);
   const [backtestConfig, setBacktestConfig] = useState<BacktestConfig>(DEFAULT_BACKTEST_CONFIG);
 
   const selectedStrategy = useMemo(
@@ -84,19 +85,28 @@ export function StrategyWorkbench() {
     [selectedStrategyId, strategies]
   );
 
+  const loadBacktestDetail = async (runId: string) => {
+    setLoadingRunDetail(true);
+    try {
+      const detail = await authorizedFetch<BacktestRun>(`${PLATFORM_API_BASE}/backtests/${runId}`, "");
+      setBacktestDetails((current) => (current[runId] === detail ? current : { ...current, [runId]: detail }));
+      return detail;
+    } finally {
+      setLoadingRunDetail(false);
+    }
+  };
+
   const loadWorkspace = async () => {
-    const [me, nextStrategies, nextBacktests, nextAudit, nextConnectivity] = await Promise.all([
+    const [me, nextStrategies, nextBacktests, nextConnectivity] = await Promise.all([
       authorizedFetch<{ user: { email: string; roles: string[] } }>(`${PLATFORM_API_BASE}/me`, ""),
       authorizedFetch<Strategy[]>(`${PLATFORM_API_BASE}/strategies`, ""),
-      authorizedFetch<BacktestRun[]>(`${PLATFORM_API_BASE}/backtests`, ""),
-      authorizedFetch<AuditEvent[]>(`${PLATFORM_API_BASE}/audit`, ""),
+      authorizedFetch<BacktestRun[]>(`${PLATFORM_API_BASE}/backtests?limit=80`, ""),
       authorizedFetch<ConnectivityStatus>(`${PLATFORM_API_BASE}/runtime/connectivity`, "").catch(() => null),
     ]);
 
     setUser(me.user);
     setStrategies(sortStrategies(nextStrategies));
     setBacktests(sortRuns(nextBacktests));
-    setAuditEvents(nextAudit);
     setConnectivity(nextConnectivity);
 
     const nextSelected = nextStrategies.find((item) => item.id === selectedStrategyId) || nextStrategies[0] || null;
@@ -124,24 +134,34 @@ export function StrategyWorkbench() {
     () => sortRuns(backtests.filter((item) => item.strategyId === selectedStrategy?.id)),
     [backtests, selectedStrategy?.id]
   );
-  const latestRun = selectedRuns[0] || null;
-  const hasActiveRun = latestRun?.status === "queued" || latestRun?.status === "running";
+  const latestRunSummary = selectedRuns[0] || null;
+  const latestRun = latestRunSummary ? backtestDetails[latestRunSummary.id] || latestRunSummary : null;
+  const hasActiveRun = latestRunSummary?.status === "queued" || latestRunSummary?.status === "running";
 
   useEffect(() => {
-    if (!hasActiveRun) return;
+    if (!latestRunSummary?.id) return;
+    const detail = backtestDetails[latestRunSummary.id];
+    const needsDetail =
+      !detail ||
+      (!detail.marketRows?.length && !detail.logs?.length && !detail.trades?.length && !detail.assetRows?.length && latestRunSummary.status === "completed");
+    if (!needsDetail) return;
+    void loadBacktestDetail(latestRunSummary.id).catch(() => {});
+  }, [latestRunSummary?.id, latestRunSummary?.status]);
+
+  useEffect(() => {
+    if (!hasActiveRun || !latestRunSummary?.id) return;
     const timer = window.setInterval(() => {
-      void Promise.all([
-        authorizedFetch<BacktestRun[]>(`${PLATFORM_API_BASE}/backtests`, ""),
-        authorizedFetch<AuditEvent[]>(`${PLATFORM_API_BASE}/audit`, ""),
-      ])
-        .then(([runs, audit]) => {
-          setBacktests(sortRuns(runs));
-          setAuditEvents(audit);
+      void authorizedFetch<BacktestRun>(`${PLATFORM_API_BASE}/backtests/${latestRunSummary.id}/status`, "")
+        .then((run) => {
+          setBacktests((current) => sortRuns([run, ...current.filter((item) => item.id !== run.id)]));
+          if (run.status === "completed" || run.status === "failed") {
+            void loadBacktestDetail(run.id).catch(() => {});
+          }
         })
         .catch(() => {});
     }, 2000);
     return () => window.clearInterval(timer);
-  }, [hasActiveRun]);
+  }, [hasActiveRun, latestRunSummary?.id]);
 
   useEffect(() => {
     if (!latestRun) return;
@@ -253,13 +273,15 @@ export function StrategyWorkbench() {
       <BacktestRunsPanel
         selectedStrategy={selectedStrategy}
         backtests={selectedRuns}
+        latestRun={latestRun}
         busy={busy}
+        loadingRunDetail={loadingRunDetail}
         config={backtestConfig}
         onConfigChange={setBacktestConfig}
         onRunBacktest={handleRunBacktest}
       />
 
-      <ExecutionConsolePanel selectedStrategy={selectedStrategy} auditEvents={auditEvents} connectivity={connectivity} />
+      <ExecutionConsolePanel selectedStrategy={selectedStrategy} connectivity={connectivity} />
 
       <div className="rounded-xl border border-zinc-800 bg-zinc-950/70 px-4 py-3 text-sm text-zinc-400">{status}</div>
     </div>
