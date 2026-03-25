@@ -1,117 +1,12 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { Badge } from "./ui";
 import { BacktestRunsPanel, type BacktestConfig } from "./BacktestRunsPanel";
 import { ExecutionConsolePanel } from "./ExecutionConsolePanel";
 import { StrategyRegistryPanel } from "./StrategyRegistryPanel";
-import type { PlatformStrategy } from "./strategy-types";
+import { Badge } from "./ui";
+import type { AuditEvent, BacktestRun, ConnectivityStatus, PlatformStrategy } from "./strategy-types";
 import { authorizedFetch, PLATFORM_API_BASE } from "../lib/platform-client";
 
 type Strategy = PlatformStrategy;
-
-type BacktestRun = {
-  id: string;
-  strategyId: string;
-  source?: string;
-  status?: "queued" | "running" | "completed" | "failed";
-  progressPct?: number;
-  queuedAt?: number | null;
-  startedAt?: number | null;
-  completedAt?: number | null;
-  updatedAt?: number | null;
-  errorMessage?: string | null;
-  params?: Record<string, unknown>;
-  metrics: {
-    totalReturnPct: number;
-    sharpe: number;
-    maxDrawdownPct: number;
-    winRatePct: number;
-    trades: number;
-    endingEquity: number;
-  };
-  equityCurve?: Array<{ time: number; equity: number }>;
-  trades?: Array<{
-    id?: string;
-    time: number;
-    side: string;
-    action?: string;
-    eventCode?: string;
-    label?: string;
-    marker?: string;
-    positionSide?: string;
-    symbol?: string;
-    message?: string;
-    price: number;
-    quantity: number;
-    fee?: number;
-    pnl?: number;
-    lastPrice?: number;
-    equity?: number;
-    beforePosition?: { longAmount?: number; shortAmount?: number };
-    afterPosition?: { longAmount?: number; shortAmount?: number };
-  }>;
-  marketRows?: Array<{
-    time: number;
-    lastPrice: number;
-    equity: number;
-    open?: number;
-    high?: number;
-    low?: number;
-    close?: number;
-    volume?: number;
-    openInterest?: number;
-    utilization: number;
-    longAmount: number;
-    longPrice: number;
-    longProfit: number;
-    shortAmount: number;
-    shortPrice: number;
-    shortProfit: number;
-    events?: Array<{ id: string; label: string; marker: string; action: string; price: number; quantity: number; pnl: number; message: string }>;
-  }>;
-  logs?: Array<{ time: number; level: string; message: string; progressPct?: number }>;
-  assetRows?: Array<{
-    name: string;
-    asset: string;
-    balance: number;
-    frozen: number;
-    fees: number;
-    equity: number;
-    realizedPnl: number;
-    positionPnl: number;
-    margin: number;
-    estimatedProfit: number;
-  }>;
-  summary?: {
-    barCount?: number;
-    orderCount?: number;
-    dataSource?: string;
-    startedAtText?: string;
-    endedAtText?: string;
-    durationMs?: number;
-  };
-  statusInfo?: {
-    backtestStatus?: number;
-    finished?: boolean;
-    progress?: number;
-    logsCount?: number;
-    loadBytes?: number;
-    loadElapsed?: number;
-    elapsed?: number;
-    lastPrice?: number;
-    equity?: number;
-    utilization?: number;
-    longAmount?: number;
-    shortAmount?: number;
-    estimatedProfit?: number;
-    tradeCount?: number;
-  };
-};
-
-type AuditEvent = { id: string; type: string; createdAt: number; payload: Record<string, unknown> };
-type ConnectivityStatus = {
-  proxy?: { configured: boolean; httpProxy?: string; httpsProxy?: string; socksProxy?: string; mode?: string; source?: string };
-  brokers?: Array<{ brokerTarget: string; ok: boolean; latencyMs?: number; error?: string }>;
-} | null;
 
 const DEFAULT_BACKTEST_CONFIG: BacktestConfig = {
   brokerTarget: "binance:production",
@@ -166,7 +61,9 @@ function sortStrategies(items: Strategy[]) {
 }
 
 function splitPeriod(value: string | undefined) {
-  const match = String(value || "").trim().match(/^(\d+)([mhd])$/i);
+  const match = String(value || "")
+    .trim()
+    .match(/^(\d+)([mhd])$/i);
   if (!match) return { value: 1, unit: "h" as const };
   return { value: Number(match[1]) || 1, unit: (match[2].toLowerCase() as "m" | "h" | "d") || "h" };
 }
@@ -252,7 +149,9 @@ export function StrategyWorkbench() {
     if (latestRun.status === "running") return void setStatus(`回测运行中，当前进度 ${latestRun.progressPct || 0}%`);
     if (latestRun.status === "failed") return void setStatus(latestRun.errorMessage || "回测执行失败");
     if (latestRun.status === "completed") {
-      setStatus(`回测完成：收益率 ${latestRun.metrics.totalReturnPct.toFixed(2)}%，最大回撤 ${latestRun.metrics.maxDrawdownPct.toFixed(2)}%，交易 ${latestRun.metrics.trades} 笔`);
+      setStatus(
+        `回测完成：收益率 ${latestRun.metrics.totalReturnPct.toFixed(2)}%，最大回撤 ${latestRun.metrics.maxDrawdownPct.toFixed(2)}%，交易 ${latestRun.metrics.trades} 笔`
+      );
     }
   }, [latestRun?.id, latestRun?.status, latestRun?.progressPct, latestRun?.errorMessage]);
 

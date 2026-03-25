@@ -52,11 +52,3 @@ export async function authorizedFetch<T>(path: string, token: string, init?: Req
 
   return json as T;
 }
-
-export function getRuntimeLabel(runtime: string) {
-  if (runtime === "paper") return "纸面";
-  if (runtime === "sandbox") return "沙盒";
-  if (runtime === "production") return "生产";
-  if (runtime === "backtest-only") return "仅回测";
-  return runtime;
-}

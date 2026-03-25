@@ -257,34 +257,6 @@ DEFAULT_PYTHON_STRATEGY = "\n".join([
     '        Sleep(2000)',
 ])
 
-DEFAULT_STRATEGY_BLUEPRINT = {
-    "name": "ETH 4h MACD Long Short",
-    "description": "Use 4h MACD golden cross to open long and close short, death cross to open short and close long. Each trade uses 10% of available USDT with 5x leverage.",
-    "marketType": "futures",
-    "symbol": "ETHUSDT",
-    "interval": "4h",
-    "runtime": "paper",
-    "template": "python",
-    "parameters": {"fastPeriod": 12, "slowPeriod": 26, "signalPeriod": 9, "positionRiskPct": 10, "leverage": 5},
-    "risk": {
-        "maxNotional": 0,
-        "maxLeverage": 5,
-        "maxDailyLoss": 200,
-        "allowedSymbols": ["ETHUSDT"],
-    },
-    "sourceCode": DEFAULT_PYTHON_STRATEGY,
-}
-
-LEGACY_DEFAULT_NAMES = {
-    "BTC SMA Trend",
-    "BTC ?????",
-    "BTC ????????",
-    "ETH Breakout",
-    "ETH ????",
-    "Python?? BTCUSDT 1h",
-    "Python??? BTCUSDT 1h",
-}
-
 BROKER_SUMMARIES = [
     {
         "brokerId": "binance",
@@ -328,18 +300,13 @@ def normalize_strategy_record(strategy: dict[str, Any]) -> dict[str, Any]:
     interval = normalized.get("interval", "")
 
     if not normalized.get("name") or looks_corrupted_text(normalized.get("name")):
-        if template == "python" and symbol == "ETHUSDT" and interval == "4h":
-            normalized["name"] = DEFAULT_STRATEGY_BLUEPRINT["name"]
-        elif template == "python":
+        if template == "python":
             normalized["name"] = f"Python Strategy {symbol} {interval}".strip()
         else:
             normalized["name"] = f"Strategy {symbol} {interval}".strip()
 
     if not normalized.get("description") or looks_corrupted_text(normalized.get("description")):
-        if template == "python" and symbol == "ETHUSDT" and interval == "4h":
-            normalized["description"] = DEFAULT_STRATEGY_BLUEPRINT["description"]
-        else:
-            normalized["description"] = "Please document this strategy in your IDE workspace."
+        normalized["description"] = "Please document this strategy in your IDE workspace."
 
     return normalized
 
@@ -361,36 +328,6 @@ def prune_missing_strategy_artifacts(strategies: list[dict[str, Any]]) -> list[d
     return [item for item in strategies if strategy_artifact_exists(item)]
 
 
-def is_legacy_default_strategy(strategy: dict[str, Any]) -> bool:
-    name = str(strategy.get("name") or "")
-    template = strategy.get("template")
-    symbol = str(strategy.get("symbol") or "").upper()
-    interval = str(strategy.get("interval") or "")
-
-    if name in LEGACY_DEFAULT_NAMES:
-        return True
-    if template in {"smaCross", "breakout"}:
-        return True
-    if template == "python" and symbol == "BTCUSDT" and interval == "1h" and ("Python" in name or "???" in name or "??" in name):
-        return True
-    return False
-
-
-def build_default_strategy(timestamp: int) -> dict[str, Any]:
-    compiler = compile_python_strategy(DEFAULT_PYTHON_STRATEGY)
-    strategy = {
-        **DEFAULT_STRATEGY_BLUEPRINT,
-        "id": create_id("strat"),
-        "createdAt": timestamp,
-        "updatedAt": timestamp,
-        "compiler": {**compiler, "checkedAt": timestamp},
-    }
-    artifact_summary = ensure_strategy_artifact(strategy)
-    if artifact_summary:
-        strategy["artifactSummary"] = artifact_summary
-    return strategy
-
-
 def ensure_bootstrap_user() -> dict[str, Any]:
     state = db.read()
     if state["users"]:
@@ -404,54 +341,6 @@ def ensure_bootstrap_user() -> dict[str, Any]:
     }
     db.update(lambda current: {**current, "users": [user, *current["users"]]})
     return user
-
-
-def ensure_default_strategies() -> list[dict[str, Any]]:
-    state = db.read()
-    timestamp = now_ms()
-    current_strategies = prune_missing_strategy_artifacts([normalize_strategy_record(item) for item in state["strategies"]])
-    filtered_strategies = [item for item in current_strategies if not is_legacy_default_strategy(item)]
-
-    default_strategy = next(
-        (
-            item
-            for item in filtered_strategies
-            if item.get("template") == "python"
-            and str(item.get("symbol") or "").upper() == "ETHUSDT"
-            and item.get("interval") == "4h"
-            and item.get("name") == DEFAULT_STRATEGY_BLUEPRINT["name"]
-        ),
-        None,
-    )
-
-    if default_strategy is not None:
-        default_strategy = {
-            **default_strategy,
-            "description": DEFAULT_STRATEGY_BLUEPRINT["description"],
-            "marketType": DEFAULT_STRATEGY_BLUEPRINT["marketType"],
-            "symbol": DEFAULT_STRATEGY_BLUEPRINT["symbol"],
-            "interval": DEFAULT_STRATEGY_BLUEPRINT["interval"],
-            "runtime": DEFAULT_STRATEGY_BLUEPRINT["runtime"],
-            "template": DEFAULT_STRATEGY_BLUEPRINT["template"],
-            "parameters": dict(DEFAULT_STRATEGY_BLUEPRINT["parameters"]),
-            "risk": {**DEFAULT_STRATEGY_BLUEPRINT["risk"]},
-            "sourceCode": DEFAULT_PYTHON_STRATEGY,
-        }
-        if not default_strategy.get("compiler"):
-            default_strategy["compiler"] = {**compile_python_strategy(DEFAULT_PYTHON_STRATEGY), "checkedAt": timestamp}
-        if not default_strategy.get("artifactSummary"):
-            artifact_summary = ensure_strategy_artifact(default_strategy)
-            if artifact_summary:
-                default_strategy["artifactSummary"] = artifact_summary
-        filtered_strategies = [
-            default_strategy if item.get("id") == default_strategy.get("id") else item
-            for item in filtered_strategies
-        ]
-
-    changed = filtered_strategies != state["strategies"]
-    if changed:
-        db.write({**state, "strategies": filtered_strategies})
-    return sorted(filtered_strategies, key=lambda item: item["updatedAt"], reverse=True)
 
 
 def list_strategies() -> list[dict[str, Any]]:
@@ -539,19 +428,6 @@ def parse_broker_target(target: str | None) -> tuple[BrokerId, BrokerMode, str]:
     if broker_mode != "production":
         broker_mode = "sandbox"
     return broker_id, broker_mode, f"{broker_id}:{broker_mode}"
-
-
-def get_broker_label(target: str) -> str:
-    broker_id, broker_mode, normalized = parse_broker_target(target)
-    if normalized == "paper":
-        return "Paper"
-    return f"{broker_id.upper() if broker_id == 'okx' else broker_id.capitalize()} {'Production' if broker_mode == 'production' else 'Sandbox'}"
-
-
-def get_default_execution_target(runtime: str) -> str:
-    if runtime == "paper":
-        return "paper"
-    return "binance:production" if runtime == "production" else "binance:sandbox"
 
 
 def sanitize_user(user: dict[str, Any]) -> dict[str, Any]:
@@ -680,18 +556,6 @@ def start_backtest_job(run_id: str, actor_user_id: str, strategy: dict[str, Any]
             audit_event(actor_user_id, "backtest.run.failed", {"strategyId": payload.strategyId, "brokerTarget": payload.brokerTarget, "runId": run_id, "error": error_text})
 
     Thread(target=worker, daemon=True).start()
-
-
-def to_unified_symbol(symbol: str) -> str:
-    normalized = symbol.upper()
-    for quote in ("USDT", "USDC", "BUSD", "FDUSD", "USD"):
-        if normalized.endswith(quote) and len(normalized) > len(quote):
-            return f"{normalized[:-len(quote)]}/{quote}"
-    return normalized
-
-
-def to_compact_symbol(symbol: str) -> str:
-    return symbol.upper().replace("/", "").replace(":USDT", "").replace("-SWAP", "")
 
 
 def get_proxy_environment() -> dict[str, str]:
@@ -927,14 +791,12 @@ def brokers(authorization: str | None = Header(default=None)):
 @app.get("/api/platform/strategies")
 def strategies(authorization: str | None = Header(default=None)):
     require_user(authorization)
-    ensure_default_strategies()
     return [get_strategy_summary(item) for item in list_strategies()]
 
 
 @app.post("/api/platform/strategies")
 def save_strategy(payload: StrategyRequest, authorization: str | None = Header(default=None)):
     require_user(authorization)
-    ensure_default_strategies()
     existing = next((item for item in list_strategies() if item["id"] == payload.id), None)
     timestamp = now_ms()
     compiler = None
@@ -1237,7 +1099,6 @@ def research_modules(authorization: str | None = Header(default=None)):
 @app.get("/research/strategies")
 def research_strategies(authorization: str | None = Header(default=None)):
     require_user(authorization)
-    ensure_default_strategies()
     return [get_strategy_summary(item) for item in list_strategies()]
 
 
