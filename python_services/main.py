@@ -1,28 +1,29 @@
 from __future__ import annotations
 
-import base64
 import ast
 import hashlib
 import json
-import math
 import os
 import re
 import secrets
 import time
 import urllib.request
+import urllib.error
 from pathlib import Path
-from threading import Lock
+from threading import RLock, Thread
 from typing import Any, Literal
 
-import ccxt
-import pandas as pd
-import polars as pl
 import uvicorn
-import vectorbt as vbt
-from cryptography.fernet import Fernet
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
+
+try:
+    from .fmz_backtest import BacktestConfig as FmzBacktestConfig
+    from .fmz_backtest import run_fmz_backtest
+except ImportError:
+    from fmz_backtest import BacktestConfig as FmzBacktestConfig
+    from fmz_backtest import run_fmz_backtest
 
 
 def load_local_env() -> None:
@@ -72,27 +73,12 @@ def sha256(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
-def build_fernet() -> Fernet:
-    secret = os.getenv("SECRET_STORE_KEY", "replace-with-a-long-random-secret").encode("utf-8")
-    digest = hashlib.sha256(secret).digest()
-    return Fernet(base64.urlsafe_b64encode(digest))
-
-
-FERNET = build_fernet()
-
-
-def encrypt_secret(value: str) -> str:
-    return FERNET.encrypt(value.encode("utf-8")).decode("utf-8")
-
-
-def decrypt_secret(value: str) -> str:
-    return FERNET.decrypt(value.encode("utf-8")).decode("utf-8")
-
-
 class JsonDb:
     def __init__(self, path: Path):
         self.path = path
-        self.lock = Lock()
+        self.backup_path = self.path.with_suffix(f"{self.path.suffix}.bak")
+        self.temp_path = self.path.with_suffix(f"{self.path.suffix}.tmp")
+        self.lock = RLock()
         if not self.path.exists():
             self.write(self.default_state())
 
@@ -110,123 +96,194 @@ class JsonDb:
 
     def read(self) -> dict[str, Any]:
         with self.lock:
-            with self.path.open("r", encoding="utf-8") as handle:
-                return json.load(handle)
+            try:
+                with self.path.open("r", encoding="utf-8") as handle:
+                    return json.load(handle)
+            except json.JSONDecodeError:
+                if self.backup_path.exists():
+                    try:
+                        with self.backup_path.open("r", encoding="utf-8") as handle:
+                            state = json.load(handle)
+                        self._write_unlocked(state)
+                        return state
+                    except json.JSONDecodeError:
+                        pass
+
+                self._archive_corrupt_files()
+                state = self.default_state()
+                self._write_unlocked(state)
+                return state
 
     def write(self, state: dict[str, Any]) -> None:
         with self.lock:
-            with self.path.open("w", encoding="utf-8") as handle:
-                json.dump(state, handle, ensure_ascii=False, indent=2)
+            self._write_unlocked(state)
 
     def update(self, fn):
-        state = self.read()
-        next_state = fn(state)
-        self.write(next_state)
-        return next_state
+        with self.lock:
+            state = self.read()
+            next_state = fn(state)
+            self._write_unlocked(next_state)
+            return next_state
+
+    def _write_unlocked(self, state: dict[str, Any]) -> None:
+        with self.temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(state, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        if self.path.exists():
+            self.path.replace(self.backup_path)
+        self.temp_path.replace(self.path)
+
+    def _archive_corrupt_files(self) -> None:
+        timestamp = int(time.time() * 1000)
+        if self.path.exists():
+            self.path.replace(self.path.with_suffix(f"{self.path.suffix}.corrupt.{timestamp}"))
+        if self.backup_path.exists():
+            self.backup_path.replace(self.backup_path.with_suffix(f"{self.backup_path.suffix}.corrupt.{timestamp}"))
 
 
 db = JsonDb(DB_PATH)
 
 
-DEFAULT_STRATEGIES = [
-    {
-        "name": "BTC 双均线趋势",
-        "description": "使用快慢均线交叉识别趋势方向，适合先做回测和纸面验证。",
-        "marketType": "futures",
-        "symbol": "BTCUSDT",
-        "interval": "1h",
-        "runtime": "sandbox",
-        "template": "smaCross",
-        "parameters": {"fastPeriod": 20, "slowPeriod": 50, "positionSizeUsd": 1500},
-        "risk": {
-            "maxNotional": 5000,
-            "maxLeverage": 3,
-            "maxDailyLoss": 400,
-            "allowedSymbols": ["BTCUSDT", "ETHUSDT"],
-        },
+
+DEFAULT_PYTHON_STRATEGY = "\n".join([
+    '#!Python3',
+    "'''backtest",
+    'start: 2025-03-23 00:00:00',
+    'end: 2026-03-21 08:00:00',
+    'period: 4h',
+    'basePeriod: 1h',
+    'exchanges: [{"eid":"Futures_Binance","currency":"ETH_USDT","balance":10000}]',
+    "'''",
+    '',
+    'FAST = 12',
+    'SLOW = 26',
+    'SIGNAL = 9',
+    'POSITION_RISK = 0.10',
+    'LEVERAGE = 5',
+    'MIN_ORDER_AMOUNT = 0.01',
+    '',
+    'last_bar_time = 0',
+    '',
+    'def get_position(position_type):',
+    '    positions = exchange.GetPosition()',
+    '    if not positions:',
+    '        return False, 0',
+    '    for position in positions:',
+    '        if position.get("Type") == position_type and float(position.get("Amount", 0)) > 0:',
+    '            return True, float(position["Amount"])',
+    '    return False, 0',
+    '',
+    'def get_available_usdt():',
+    '    account = exchange.GetAccount()',
+    '    if not account:',
+    '        return 0',
+    '    for asset in account.get("Assets", []):',
+    '        if asset.get("Currency") == "USDT":',
+    '            return float(asset.get("Amount", 0))',
+    '    return float(account.get("Balance") or 0)',
+    '',
+    'def get_order_amount(records):',
+    '    if not records:',
+    '        return 0',
+    '    available_usdt = get_available_usdt()',
+    '    close_price = float(records[-1]["Close"])',
+    '    if available_usdt <= 0 or close_price <= 0:',
+    '        return 0',
+    '    notional = available_usdt * POSITION_RISK * LEVERAGE',
+    '    amount = round(notional / close_price, 3)',
+    '    return amount if amount >= MIN_ORDER_AMOUNT else 0',
+    '',
+    'def get_cross_signal(records):',
+    '    macd = TA.MACD(records, FAST, SLOW, SIGNAL)',
+    '    dif = macd[0]',
+    '    dea = macd[1]',
+    '    if len(dif) < 2 or len(dea) < 2:',
+    '        return False, False',
+    '',
+    '    prev_dif = dif[-2]',
+    '    prev_dea = dea[-2]',
+    '    curr_dif = dif[-1]',
+    '    curr_dea = dea[-1]',
+    '',
+    '    golden_cross = prev_dif <= prev_dea and curr_dif > curr_dea',
+    '    death_cross = prev_dif >= prev_dea and curr_dif < curr_dea',
+    '    return golden_cross, death_cross',
+    '',
+    'def main():',
+    '    global last_bar_time',
+    '    exchange.SetContractType("swap")',
+    '    exchange.SetMarginLevel(LEVERAGE)',
+    '',
+    '    while True:',
+    '        records = exchange.GetRecords(PERIOD_H4)',
+    '        if not records or len(records) < 100:',
+    '            Sleep(2000)',
+    '            continue',
+    '',
+    '        current_bar_time = records[-1]["Time"]',
+    '        if current_bar_time == last_bar_time:',
+    '            Sleep(2000)',
+    '            continue',
+    '',
+    '        last_bar_time = current_bar_time',
+    '        golden_cross, death_cross = get_cross_signal(records)',
+    '        has_long, long_amount = get_position(PD_LONG)',
+    '        has_short, short_amount = get_position(PD_SHORT)',
+    '        order_amount = get_order_amount(records)',
+    '',
+    '        LogStatus("ETH 4h MACD Strategy\\n", "Golden:", golden_cross, " Death:", death_cross, "\\nHasLong:", has_long, " LongAmount:", long_amount, "\\nHasShort:", has_short, " ShortAmount:", short_amount, "\\nOrderAmount:", order_amount)',
+    '',
+    '        if golden_cross:',
+    '            if has_short:',
+    '                exchange.SetDirection("closesell")',
+    '                exchange.Buy(-1, short_amount)',
+    '                Log("MACD golden cross close short", records[-1]["Close"], short_amount)',
+    '            if (not has_long) and order_amount > 0:',
+    '                exchange.SetDirection("buy")',
+    '                exchange.Buy(-1, order_amount)',
+    '                Log("MACD golden cross open long", records[-1]["Close"], order_amount)',
+    '        elif death_cross:',
+    '            if has_long:',
+    '                exchange.SetDirection("closebuy")',
+    '                exchange.Sell(-1, long_amount)',
+    '                Log("MACD death cross close long", records[-1]["Close"], long_amount)',
+    '            if (not has_short) and order_amount > 0:',
+    '                exchange.SetDirection("sell")',
+    '                exchange.Sell(-1, order_amount)',
+    '                Log("MACD death cross open short", records[-1]["Close"], order_amount)',
+    '',
+    '        Sleep(2000)',
+])
+
+DEFAULT_STRATEGY_BLUEPRINT = {
+    "name": "ETH 4h MACD Long Short",
+    "description": "Use 4h MACD golden cross to open long and close short, death cross to open short and close long. Each trade uses 10% of available USDT with 5x leverage.",
+    "marketType": "futures",
+    "symbol": "ETHUSDT",
+    "interval": "4h",
+    "runtime": "paper",
+    "template": "python",
+    "parameters": {"fastPeriod": 12, "slowPeriod": 26, "signalPeriod": 9, "positionRiskPct": 10, "leverage": 5},
+    "risk": {
+        "maxNotional": 0,
+        "maxLeverage": 5,
+        "maxDailyLoss": 200,
+        "allowedSymbols": ["ETHUSDT"],
     },
-    {
-        "name": "ETH 突破模板",
-        "description": "基于突破窗口寻找入场信号，适合验证仓位控制和止盈止损参数。",
-        "marketType": "spot",
-        "symbol": "ETHUSDT",
-        "interval": "4h",
-        "runtime": "paper",
-        "template": "breakout",
-        "parameters": {"breakoutLookback": 20, "positionSizeUsd": 1000, "stopLossPct": 2, "takeProfitPct": 4},
-        "risk": {
-            "maxNotional": 3000,
-            "maxLeverage": 1,
-            "maxDailyLoss": 250,
-            "allowedSymbols": ["ETHUSDT"],
-        },
-    },
-]
+    "sourceCode": DEFAULT_PYTHON_STRATEGY,
+}
 
-DEFAULT_PYTHON_STRATEGY = """import polars as pl
-
-
-def generate_signals(frame: pl.DataFrame, params: dict) -> dict:
-    fast_period = int(params.get("fastPeriod", 20))
-    slow_period = int(params.get("slowPeriod", 50))
-
-    if frame.height == 0:
-        return {"entries": [], "exits": []}
-
-    close = frame["close"]
-    fast = close.rolling_mean(fast_period)
-    slow = close.rolling_mean(slow_period)
-
-    entries: list[bool] = []
-    exits: list[bool] = []
-    previous_fast = None
-    previous_slow = None
-
-    for current_fast, current_slow in zip(fast.to_list(), slow.to_list()):
-        can_compare = None not in (previous_fast, previous_slow, current_fast, current_slow)
-        entries.append(bool(can_compare and current_fast > current_slow and previous_fast <= previous_slow))
-        exits.append(bool(can_compare and current_fast < current_slow and previous_fast >= previous_slow))
-        previous_fast = current_fast
-        previous_slow = current_slow
-
-    return {"entries": entries, "exits": exits}
-"""
-
-DEFAULT_STRATEGIES = [
-    {
-        "name": "BTC 双均线趋势",
-        "description": "使用快慢均线交叉识别趋势方向，适合先做回测和纸面验证。",
-        "marketType": "futures",
-        "symbol": "BTCUSDT",
-        "interval": "1h",
-        "runtime": "sandbox",
-        "template": "smaCross",
-        "parameters": {"fastPeriod": 20, "slowPeriod": 50, "positionSizeUsd": 1500},
-        "risk": {
-            "maxNotional": 5000,
-            "maxLeverage": 3,
-            "maxDailyLoss": 400,
-            "allowedSymbols": ["BTCUSDT", "ETHUSDT"],
-        },
-    },
-    {
-        "name": "ETH 突破模板",
-        "description": "基于突破窗口寻找入场信号，适合验证仓位控制和止盈止损参数。",
-        "marketType": "spot",
-        "symbol": "ETHUSDT",
-        "interval": "4h",
-        "runtime": "paper",
-        "template": "breakout",
-        "parameters": {"breakoutLookback": 20, "positionSizeUsd": 1000, "stopLossPct": 2, "takeProfitPct": 4},
-        "risk": {
-            "maxNotional": 3000,
-            "maxLeverage": 1,
-            "maxDailyLoss": 250,
-            "allowedSymbols": ["ETHUSDT"],
-        },
-    },
-]
-
+LEGACY_DEFAULT_NAMES = {
+    "BTC SMA Trend",
+    "BTC ?????",
+    "BTC ????????",
+    "ETH Breakout",
+    "ETH ????",
+    "Python?? BTCUSDT 1h",
+    "Python??? BTCUSDT 1h",
+}
 
 BROKER_SUMMARIES = [
     {
@@ -270,29 +327,68 @@ def normalize_strategy_record(strategy: dict[str, Any]) -> dict[str, Any]:
     symbol = normalized.get("symbol", "UNKNOWN")
     interval = normalized.get("interval", "")
 
-    if normalized.get("name") == "BTC SMA Trend":
-        normalized["name"] = "BTC 双均线趋势"
-    if normalized.get("description") == "Fast and slow moving average crossover validated through the research runtime.":
-        normalized["description"] = "使用快慢均线交叉识别趋势方向，适合先做回测和纸面验证。"
-
-    if normalized.get("name") == "ETH Breakout":
-        normalized["name"] = "ETH 突破模板"
-    if normalized.get("description") == "Breakout template for paper deployment and portfolio sizing validation.":
-        normalized["description"] = "基于突破窗口寻找入场信号，适合验证仓位控制和止盈止损参数。"
-
-    if looks_corrupted_text(normalized.get("name")):
-        if template == "python":
-            normalized["name"] = f"Python策略 {symbol} {interval}".strip()
+    if not normalized.get("name") or looks_corrupted_text(normalized.get("name")):
+        if template == "python" and symbol == "ETHUSDT" and interval == "4h":
+            normalized["name"] = DEFAULT_STRATEGY_BLUEPRINT["name"]
+        elif template == "python":
+            normalized["name"] = f"Python Strategy {symbol} {interval}".strip()
         else:
-            normalized["name"] = f"策略 {symbol} {interval}".strip()
+            normalized["name"] = f"Strategy {symbol} {interval}".strip()
 
-    if looks_corrupted_text(normalized.get("description")):
-        if template == "python":
-            normalized["description"] = "历史乱码已自动修复。请补充这条策略的用途说明。"
+    if not normalized.get("description") or looks_corrupted_text(normalized.get("description")):
+        if template == "python" and symbol == "ETHUSDT" and interval == "4h":
+            normalized["description"] = DEFAULT_STRATEGY_BLUEPRINT["description"]
         else:
-            normalized["description"] = "历史乱码已自动修复。请补充这条策略的说明。"
+            normalized["description"] = "Please document this strategy in your IDE workspace."
 
     return normalized
+
+
+def strategy_artifact_exists(strategy: dict[str, Any]) -> bool:
+    if strategy.get("template") != "python":
+        return True
+    artifact_summary = strategy.get("artifactSummary") or {}
+    root_dir = artifact_summary.get("rootDir")
+    if root_dir:
+        return Path(root_dir).exists()
+    strategy_name = str(strategy.get("name") or "").strip()
+    if strategy_name:
+        return (STRATEGY_STORE_ROOT / slugify_filename(strategy_name)).exists()
+    return False
+
+
+def prune_missing_strategy_artifacts(strategies: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [item for item in strategies if strategy_artifact_exists(item)]
+
+
+def is_legacy_default_strategy(strategy: dict[str, Any]) -> bool:
+    name = str(strategy.get("name") or "")
+    template = strategy.get("template")
+    symbol = str(strategy.get("symbol") or "").upper()
+    interval = str(strategy.get("interval") or "")
+
+    if name in LEGACY_DEFAULT_NAMES:
+        return True
+    if template in {"smaCross", "breakout"}:
+        return True
+    if template == "python" and symbol == "BTCUSDT" and interval == "1h" and ("Python" in name or "???" in name or "??" in name):
+        return True
+    return False
+
+
+def build_default_strategy(timestamp: int) -> dict[str, Any]:
+    compiler = compile_python_strategy(DEFAULT_PYTHON_STRATEGY)
+    strategy = {
+        **DEFAULT_STRATEGY_BLUEPRINT,
+        "id": create_id("strat"),
+        "createdAt": timestamp,
+        "updatedAt": timestamp,
+        "compiler": {**compiler, "checkedAt": timestamp},
+    }
+    artifact_summary = ensure_strategy_artifact(strategy)
+    if artifact_summary:
+        strategy["artifactSummary"] = artifact_summary
+    return strategy
 
 
 def ensure_bootstrap_user() -> dict[str, Any]:
@@ -312,31 +408,55 @@ def ensure_bootstrap_user() -> dict[str, Any]:
 
 def ensure_default_strategies() -> list[dict[str, Any]]:
     state = db.read()
-    current_strategies = [normalize_strategy_record(item) for item in state["strategies"]]
-    state_changed = current_strategies != state["strategies"]
-    if len(current_strategies) >= len(DEFAULT_STRATEGIES):
-        if state_changed:
-            db.write({**state, "strategies": current_strategies})
-        return sorted(current_strategies, key=lambda item: item["updatedAt"], reverse=True)
     timestamp = now_ms()
+    current_strategies = prune_missing_strategy_artifacts([normalize_strategy_record(item) for item in state["strategies"]])
+    filtered_strategies = [item for item in current_strategies if not is_legacy_default_strategy(item)]
 
-    def updater(current: dict[str, Any]) -> dict[str, Any]:
-        strategies = [normalize_strategy_record(item) for item in current["strategies"]]
-        for template in DEFAULT_STRATEGIES:
-            exists = any(item["name"] == template["name"] and item["symbol"] == template["symbol"] for item in strategies)
-            if exists:
-                continue
-            strategies.append({**template, "id": create_id("strat"), "createdAt": timestamp, "updatedAt": timestamp})
-        return {**current, "strategies": strategies}
+    default_strategy = next(
+        (
+            item
+            for item in filtered_strategies
+            if item.get("template") == "python"
+            and str(item.get("symbol") or "").upper() == "ETHUSDT"
+            and item.get("interval") == "4h"
+            and item.get("name") == DEFAULT_STRATEGY_BLUEPRINT["name"]
+        ),
+        None,
+    )
 
-    db.update(updater)
-    refreshed = db.read()
-    return sorted(refreshed["strategies"], key=lambda item: item["updatedAt"], reverse=True)
+    if default_strategy is not None:
+        default_strategy = {
+            **default_strategy,
+            "description": DEFAULT_STRATEGY_BLUEPRINT["description"],
+            "marketType": DEFAULT_STRATEGY_BLUEPRINT["marketType"],
+            "symbol": DEFAULT_STRATEGY_BLUEPRINT["symbol"],
+            "interval": DEFAULT_STRATEGY_BLUEPRINT["interval"],
+            "runtime": DEFAULT_STRATEGY_BLUEPRINT["runtime"],
+            "template": DEFAULT_STRATEGY_BLUEPRINT["template"],
+            "parameters": dict(DEFAULT_STRATEGY_BLUEPRINT["parameters"]),
+            "risk": {**DEFAULT_STRATEGY_BLUEPRINT["risk"]},
+            "sourceCode": DEFAULT_PYTHON_STRATEGY,
+        }
+        if not default_strategy.get("compiler"):
+            default_strategy["compiler"] = {**compile_python_strategy(DEFAULT_PYTHON_STRATEGY), "checkedAt": timestamp}
+        if not default_strategy.get("artifactSummary"):
+            artifact_summary = ensure_strategy_artifact(default_strategy)
+            if artifact_summary:
+                default_strategy["artifactSummary"] = artifact_summary
+        filtered_strategies = [
+            default_strategy if item.get("id") == default_strategy.get("id") else item
+            for item in filtered_strategies
+        ]
+
+    changed = filtered_strategies != state["strategies"]
+    if changed:
+        db.write({**state, "strategies": filtered_strategies})
+    return sorted(filtered_strategies, key=lambda item: item["updatedAt"], reverse=True)
 
 
 def list_strategies() -> list[dict[str, Any]]:
     state = db.read()
-    strategies = [normalize_strategy_record(item) for item in state["strategies"]]
+    strategies = prune_missing_strategy_artifacts([normalize_strategy_record(item) for item in state["strategies"]])
     if strategies != state["strategies"]:
         db.write({**state, "strategies": strategies})
     return sorted(strategies, key=lambda item: item["updatedAt"], reverse=True)
@@ -365,7 +485,7 @@ def ensure_strategy_artifact(strategy: dict[str, Any]) -> dict[str, Any] | None:
     strategy_id = strategy["id"]
     strategy_name = strategy.get("name") or strategy_id
     version = int(strategy.get("updatedAt") or now_ms())
-    folder_name = f"{slugify_filename(strategy_name)}__{strategy_id}"
+    folder_name = slugify_filename(strategy_name)
     strategy_dir = STRATEGY_STORE_ROOT / folder_name
     strategy_dir.mkdir(parents=True, exist_ok=True)
 
@@ -472,57 +592,94 @@ def list_audit_events(user_id: str) -> list[dict[str, Any]]:
     return sorted([item for item in state["auditEvents"] if item["actorUserId"] == user_id], key=lambda item: item["createdAt"], reverse=True)
 
 
-def list_credentials(user_id: str) -> list[dict[str, Any]]:
-    state = db.read()
-    return sorted([item for item in state["credentials"] if item["userId"] == user_id], key=lambda item: item["updatedAt"], reverse=True)
+def backtest_sort_key(item: dict[str, Any]) -> int:
+    return int(item.get("completedAt") or item.get("startedAt") or item.get("queuedAt") or 0)
 
 
-def get_credential(user_id: str, broker_target: str) -> dict[str, Any] | None:
-    state = db.read()
-    return next((item for item in state["credentials"] if item["userId"] == user_id and item["brokerTarget"] == broker_target), None)
+def update_backtest_run(run_id: str, updater):
+    def mutate(current: dict[str, Any]) -> dict[str, Any]:
+        runs: list[dict[str, Any]] = []
+        for item in current["backtests"]:
+            if item["id"] == run_id:
+                item = updater(dict(item))
+            runs.append(item)
+        return {**current, "backtests": runs[:200]}
+
+    db.update(mutate)
 
 
-def save_credential(user_id: str, broker_target: str, label: str, api_key: str, api_secret: str, passphrase: str | None = None) -> list[dict[str, Any]]:
-    broker_id, broker_mode, normalized = parse_broker_target(broker_target)
-    if normalized == "paper":
-        raise HTTPException(status_code=400, detail="Paper target does not support credentials")
-    if broker_id == "okx" and not (passphrase or os.getenv("OKX_API_PASSPHRASE")):
-        raise HTTPException(status_code=400, detail="OKX credentials require an API passphrase")
-
-    existing = get_credential(user_id, normalized)
+def append_backtest_log(run_id: str, message: str, level: str = "system", progress_pct: int | None = None) -> None:
     timestamp = now_ms()
-    credential = {
-        "id": existing["id"] if existing else create_id("cred"),
-        "userId": user_id,
-        "label": label,
-        "brokerId": broker_id,
-        "brokerMode": broker_mode,
-        "brokerTarget": normalized,
-        "encryptedApiKey": encrypt_secret(api_key.strip()),
-        "encryptedApiSecret": encrypt_secret(api_secret.strip()),
-        "encryptedPassphrase": encrypt_secret(passphrase.strip()) if passphrase else None,
-        "createdAt": existing["createdAt"] if existing else timestamp,
-        "updatedAt": timestamp,
-    }
 
-    def updater(current: dict[str, Any]) -> dict[str, Any]:
-        credentials = [item for item in current["credentials"] if item["id"] != credential["id"]]
-        credentials.append(credential)
-        return {**current, "credentials": credentials}
+    def mutate(item: dict[str, Any]) -> dict[str, Any]:
+        logs = list(item.get("logs") or [])
+        logs.append({"time": timestamp, "level": level, "message": message})
+        item["logs"] = logs[-300:]
+        if progress_pct is not None:
+            item["progressPct"] = progress_pct
+        item["updatedAt"] = timestamp
+        return item
 
-    db.update(updater)
-    return list_credentials(user_id)
+    update_backtest_run(run_id, mutate)
 
 
-def resolve_broker_credentials(user_id: str, broker_target: str) -> dict[str, str] | None:
-    credential = get_credential(user_id, broker_target)
-    if not credential:
-        return None
-    return {
-        "apiKey": decrypt_secret(credential["encryptedApiKey"]),
-        "apiSecret": decrypt_secret(credential["encryptedApiSecret"]),
-        "passphrase": decrypt_secret(credential["encryptedPassphrase"]) if credential.get("encryptedPassphrase") else (os.getenv("OKX_API_PASSPHRASE") or ""),
-    }
+def start_backtest_job(run_id: str, actor_user_id: str, strategy: dict[str, Any], payload: "BacktestRequest") -> None:
+    def worker():
+        append_backtest_log(run_id, "回测任务已创建，等待执行。", progress_pct=5)
+
+        def set_running(item: dict[str, Any]) -> dict[str, Any]:
+            started_at = now_ms()
+            item["status"] = "running"
+            item["startedAt"] = started_at
+            item["progressPct"] = 10
+            item["updatedAt"] = started_at
+            return item
+
+        update_backtest_run(run_id, set_running)
+        append_backtest_log(run_id, "FMZ 本地回测引擎已启动。", progress_pct=12)
+
+        _, _, config = build_backtest_contract(payload, strategy)
+
+        try:
+            run = run_fmz_backtest(
+                strategy.get("sourceCode") or DEFAULT_PYTHON_STRATEGY,
+                config,
+                progress_callback=lambda progress, message: append_backtest_log(run_id, message, progress_pct=progress),
+            )
+
+            def finalize(item: dict[str, Any]) -> dict[str, Any]:
+                completed_at = now_ms()
+                logs = list(item.get("logs") or [])
+                result_logs = list(run.get("logs") or [])
+                item.update(run)
+                item["status"] = "completed"
+                item["progressPct"] = 100
+                item["completedAt"] = completed_at
+                item["updatedAt"] = completed_at
+                item["logs"] = (logs + result_logs)[-300:]
+                item["errorMessage"] = None
+                return item
+
+            update_backtest_run(run_id, finalize)
+            append_backtest_log(run_id, "回测完成。", progress_pct=100)
+            audit_event(actor_user_id, "backtest.run.completed", {"strategyId": payload.strategyId, "brokerTarget": payload.brokerTarget, "runId": run_id})
+        except Exception as exc:
+            error_text = str(exc)
+
+            def fail(item: dict[str, Any]) -> dict[str, Any]:
+                failed_at = now_ms()
+                item["status"] = "failed"
+                item["errorMessage"] = error_text
+                item["completedAt"] = failed_at
+                item["updatedAt"] = failed_at
+                item["progressPct"] = min(int(item.get("progressPct") or 0), 95)
+                return item
+
+            update_backtest_run(run_id, fail)
+            append_backtest_log(run_id, f"回测失败：{error_text}", level="error")
+            audit_event(actor_user_id, "backtest.run.failed", {"strategyId": payload.strategyId, "brokerTarget": payload.brokerTarget, "runId": run_id, "error": error_text})
+
+    Thread(target=worker, daemon=True).start()
 
 
 def to_unified_symbol(symbol: str) -> str:
@@ -552,27 +709,6 @@ def get_proxy_environment() -> dict[str, str]:
         "proxySource": "explicit" if any((explicit_http, explicit_https, explicit_socks)) else ("system" if system_proxies else "none"),
     }
 
-
-def build_ccxt_proxy_config() -> dict[str, Any]:
-    raw_proxy = get_proxy_environment()
-    proxy_config: dict[str, Any] = {}
-
-    # ccxt only accepts one primary transport proxy at a time.
-    if raw_proxy["socksProxy"]:
-        proxy_config["socksProxy"] = raw_proxy["socksProxy"]
-    elif raw_proxy["httpsProxy"]:
-        proxy_config["httpsProxy"] = raw_proxy["httpsProxy"]
-    elif raw_proxy["httpProxy"]:
-        proxy_config["httpProxy"] = raw_proxy["httpProxy"]
-
-    if raw_proxy["wssProxy"]:
-        proxy_config["wssProxy"] = raw_proxy["wssProxy"]
-    elif raw_proxy["wsProxy"]:
-        proxy_config["wsProxy"] = raw_proxy["wsProxy"]
-
-    return proxy_config
-
-
 def get_proxy_runtime_summary() -> dict[str, Any]:
     raw_proxy = get_proxy_environment()
     active_mode = "none"
@@ -600,331 +736,108 @@ def get_proxy_runtime_summary() -> dict[str, Any]:
     }
 
 
-def create_exchange_client(broker_id: str, market_type: str, credentials: dict[str, str] | None = None, broker_mode: str = "sandbox"):
-    common: dict[str, Any] = {"enableRateLimit": True, "timeout": int(os.getenv("CCXT_TIMEOUT_MS", "10000"))}
-    common.update(build_ccxt_proxy_config())
-    if credentials:
-        common["apiKey"] = credentials["apiKey"]
-        common["secret"] = credentials["apiSecret"]
-    if broker_id == "okx":
-        if credentials:
-            common["password"] = credentials.get("passphrase") or os.getenv("OKX_API_PASSPHRASE", "")
-        common["options"] = {"defaultType": "spot" if market_type == "spot" else "swap"}
-        client = ccxt.okx(common)
-        client.session.trust_env = True
-        if broker_mode != "production":
-            client.set_sandbox_mode(True)
-        return client
-    if market_type == "spot":
-        client = ccxt.binance(common)
-        client.session.trust_env = True
-        if broker_mode != "production":
-            client.set_sandbox_mode(True)
-        return client
-    client = ccxt.binanceusdm(common)
-    client.session.trust_env = True
-    if broker_mode != "production":
-        client.set_sandbox_mode(True)
-    return client
+def build_urllib_opener() -> urllib.request.OpenerDirector:
+    proxy_env = get_proxy_environment()
+    proxies: dict[str, str] = {}
+    if proxy_env["socksProxy"]:
+        proxies["http"] = proxy_env["socksProxy"]
+        proxies["https"] = proxy_env["socksProxy"]
+    else:
+        if proxy_env["httpProxy"]:
+            proxies["http"] = proxy_env["httpProxy"]
+        if proxy_env["httpsProxy"]:
+            proxies["https"] = proxy_env["httpsProxy"]
+    return urllib.request.build_opener(urllib.request.ProxyHandler(proxies))
+
+
+def fetch_json_via_http(url: str) -> dict[str, Any]:
+    opener = build_urllib_opener()
+    timeout_seconds = max(int(os.getenv("PLATFORM_HTTP_TIMEOUT_MS", "10000")) / 1000.0, 1.0)
+    request = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": "QuantX/0.1",
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with opener.open(request, timeout=timeout_seconds) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"HTTP {exc.code}: {url}") from exc
+    except urllib.error.URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        raise RuntimeError(f"Network error: {reason}") from exc
+
+
+BROKER_LATENCY_ENDPOINTS: dict[str, dict[str, str]] = {
+    "binance:sandbox": {
+        "url": "https://testnet.binancefuture.com/fapi/v1/time",
+        "label": "Binance Sandbox",
+    },
+    "binance:production": {
+        "url": "https://fapi.binance.com/fapi/v1/time",
+        "label": "Binance Production",
+    },
+    "okx:sandbox": {
+        "url": "https://www.okx.com/api/v5/public/time",
+        "label": "OKX Sandbox",
+    },
+    "okx:production": {
+        "url": "https://www.okx.com/api/v5/public/time",
+        "label": "OKX Production",
+    },
+}
+
+
+def parse_remote_time(normalized_target: str, payload: dict[str, Any]) -> int | None:
+    if normalized_target.startswith("binance:"):
+        server_time = payload.get("serverTime")
+        return int(server_time) if server_time is not None else None
+    if normalized_target.startswith("okx:"):
+        data = payload.get("data") or []
+        if data and isinstance(data[0], dict):
+            ts = data[0].get("ts")
+            return int(ts) if ts is not None else None
+    return None
 
 
 def measure_broker_latency(broker_target: str, market_type: str = "futures") -> dict[str, Any]:
     broker_id, broker_mode, normalized = parse_broker_target(broker_target)
+    endpoint = BROKER_LATENCY_ENDPOINTS.get(normalized)
+    if not endpoint:
+        raise RuntimeError(f"Unsupported broker target: {normalized}")
     started_at = now_ms()
     started_perf = time.perf_counter()
-    client = create_exchange_client(broker_id, market_type, broker_mode=broker_mode)
-    remote_time = client.fetch_time()
+    payload = fetch_json_via_http(endpoint["url"])
     latency_ms = round((time.perf_counter() - started_perf) * 1000, 2)
+    remote_time = parse_remote_time(normalized, payload)
     return {
         "brokerTarget": normalized,
         "ok": True,
         "latencyMs": latency_ms,
         "remoteTime": remote_time,
+        "label": endpoint["label"],
         "checkedAt": started_at,
     }
-
-
-def resolve_market_symbol(client: Any, broker_id: str, market_type: str, compact_symbol: str) -> str:
-    markets = client.load_markets()
-    target = compact_symbol.upper()
-    for market in markets.values():
-        if broker_id == "okx":
-            type_match = bool(market.get("spot")) if market_type == "spot" else bool(market.get("swap") or market.get("future"))
-            if not type_match:
-                continue
-            if to_compact_symbol(str(market.get("symbol") or market.get("id") or "")) == target:
-                return str(market["symbol"])
-        elif str(market.get("id") or "").upper() == target:
-            return str(market["symbol"])
-    return to_unified_symbol(compact_symbol)
-
-
-def interval_to_millis(interval: str) -> int:
-    unit = interval[-1].lower() if interval else "h"
-    value = int(interval[:-1]) if interval[:-1].isdigit() else 1
-    if unit == "m":
-        return value * 60_000
-    if unit == "h":
-        return value * 3_600_000
-    if unit == "d":
-        return value * 86_400_000
-    return 3_600_000
-
-
-def generate_synthetic_ohlcv(symbol: str, interval: str, limit: int) -> pl.DataFrame:
-    step = interval_to_millis(interval)
-    end_ts = (now_ms() // step) * step
-    base = 100 + (sum(ord(ch) for ch in symbol.upper()) % 5000) / 10
-    rows: list[dict[str, float | int]] = []
-    for index in range(limit):
-        ts = end_ts - (limit - index - 1) * step
-        drift = index * 0.18
-        wave = math.sin(index / 7) * 4.5 + math.cos(index / 13) * 2.2
-        open_price = base + drift + wave
-        close_price = open_price + math.sin(index / 3) * 1.4
-        high_price = max(open_price, close_price) + 1.2 + abs(math.cos(index / 5))
-        low_price = min(open_price, close_price) - 1.2 - abs(math.sin(index / 5))
-        volume = 1000 + abs(math.sin(index / 4)) * 400 + index * 3
-        rows.append(
-            {
-                "timestamp": int(ts),
-                "open": float(open_price),
-                "high": float(high_price),
-                "low": float(low_price),
-                "close": float(close_price),
-                "volume": float(volume),
-            }
-        )
-    return pl.DataFrame(rows)
-
-
-def fetch_ohlcv_frame(broker_target: str, market_type: str, symbol: str, interval: str, limit: int) -> tuple[pl.DataFrame, str]:
-    broker_id, broker_mode, normalized = parse_broker_target(broker_target)
-    if normalized == "paper":
-        broker_id = "binance"
-        broker_mode = "sandbox"
-    try:
-        client = create_exchange_client(broker_id, market_type, broker_mode=broker_mode)
-        market_symbol = resolve_market_symbol(client, broker_id, market_type, symbol)
-        rows = client.fetch_ohlcv(market_symbol, interval, limit=limit)
-        if not rows:
-            raise ValueError("No historical candles returned from broker")
-        return (
-            pl.DataFrame(
-                {
-                    "timestamp": [int(item[0]) for item in rows],
-                    "open": [float(item[1]) for item in rows],
-                    "high": [float(item[2]) for item in rows],
-                    "low": [float(item[3]) for item in rows],
-                    "close": [float(item[4]) for item in rows],
-                    "volume": [float(item[5]) if len(item) > 5 and item[5] is not None else 0.0 for item in rows],
-                }
-            ),
-            "broker-historical",
-        )
-    except Exception as exc:
-        print(f"[market-data] fallback to synthetic candles for {broker_target} {market_type} {symbol} {interval}: {exc}")
-        return generate_synthetic_ohlcv(symbol, interval, limit), "synthetic-fallback"
-
-
-def strategy_signals(strategy: dict[str, Any], frame: pl.DataFrame):
-    index = pd.to_datetime(frame["timestamp"].to_list(), unit="ms")
-    close = pd.Series(frame["close"].to_list(), index=index)
-    if strategy["template"] == "python":
-        return close, *run_python_strategy_signals(strategy, frame, index)
-    if strategy["template"] == "smaCross":
-        fast = int(strategy["parameters"].get("fastPeriod", 20))
-        slow = int(strategy["parameters"].get("slowPeriod", 50))
-        fast_ma = close.rolling(fast).mean()
-        slow_ma = close.rolling(slow).mean()
-        entries = (fast_ma > slow_ma) & (fast_ma.shift(1) <= slow_ma.shift(1))
-        exits = (fast_ma < slow_ma) & (fast_ma.shift(1) >= slow_ma.shift(1))
-        return close, entries.fillna(False), exits.fillna(False)
-    lookback = int(strategy["parameters"].get("breakoutLookback", 20))
-    rolling_high = close.rolling(lookback).max().shift(1)
-    rolling_low = close.rolling(lookback).min().shift(1)
-    return close, (close > rolling_high).fillna(False), (close < rolling_low).fillna(False)
-
-
-def _coerce_signal_series(values: Any, index: pd.Index, field_name: str) -> pd.Series:
-    if isinstance(values, pl.Series):
-        items = values.to_list()
-    elif isinstance(values, pd.Series):
-        items = values.tolist()
-    elif isinstance(values, list):
-        items = values
-    else:
-        raise ValueError(f"{field_name} must be a list, pandas Series, or polars Series")
-
-    if len(items) != len(index):
-        raise ValueError(f"{field_name} length must match the number of candles")
-    return pd.Series([bool(item) for item in items], index=index).fillna(False)
-
-
-def run_python_strategy_signals(strategy: dict[str, Any], frame: pl.DataFrame, index: pd.Index) -> tuple[pd.Series, pd.Series]:
-    source_code = (strategy.get("sourceCode") or "").strip()
-    if not source_code:
-        raise ValueError("Python strategy source code is empty")
-
-    compiler = compile_python_strategy(source_code)
-    if not compiler["valid"]:
-        raise ValueError("Python strategy compilation failed: " + "; ".join(compiler["errors"]))
-
-    namespace: dict[str, Any] = {}
-    safe_globals: dict[str, Any] = {
-        "__builtins__": {
-            "__import__": __import__,
-            "abs": abs,
-            "all": all,
-            "any": any,
-            "bool": bool,
-            "dict": dict,
-            "enumerate": enumerate,
-            "float": float,
-            "int": int,
-            "len": len,
-            "list": list,
-            "max": max,
-            "min": min,
-            "range": range,
-            "round": round,
-            "sum": sum,
-            "zip": zip,
-        },
-        "pl": pl,
-        "math": math,
-    }
-    exec(compile(source_code, "<strategy>", "exec"), safe_globals, namespace)
-    generate_signals = namespace.get("generate_signals") or safe_globals.get("generate_signals")
-    if not callable(generate_signals):
-        raise ValueError("generate_signals(frame, params) was not defined")
-
-    result = generate_signals(frame, strategy.get("parameters", {}))
-    if not isinstance(result, dict):
-        raise ValueError("generate_signals must return a dict with entries and exits")
-
-    entries = _coerce_signal_series(result.get("entries", []), index, "entries")
-    exits = _coerce_signal_series(result.get("exits", []), index, "exits")
-    return entries, exits
-
-
-def serialize_trade_records(portfolio) -> list[dict[str, Any]]:
-    try:
-        records = portfolio.trades.records_readable
-        return [
-            {
-                "time": now_ms(),
-                "side": str(record["Direction"]).upper(),
-                "price": float(record.get("Avg Exit Price") or record.get("Avg Entry Price") or 0),
-                "quantity": float(record.get("Size") or 0),
-                "fee": float(record.get("Fees") or 0),
-                "pnl": float(record.get("PnL") or 0),
-                "reason": "vectorbt",
-            }
-            for _, record in records.iterrows()
-        ]
-    except Exception:
-        return []
-
-
-def run_vectorbt_backtest(strategy: dict[str, Any], frame: pl.DataFrame, lookback: int, initial_capital: float, fee_bps: float, slippage_bps: float) -> dict[str, Any]:
-    close, entries, exits = strategy_signals(strategy, frame)
-    portfolio = vbt.Portfolio.from_signals(
-        close,
-        entries,
-        exits,
-        init_cash=initial_capital,
-        fees=fee_bps / 10_000,
-        slippage=slippage_bps / 10_000,
-        freq=strategy["interval"],
-    )
-    value = portfolio.value()
-    total_return = portfolio.total_return()
-    sharpe_ratio = portfolio.sharpe_ratio()
-    max_drawdown = portfolio.max_drawdown()
-    win_rate = portfolio.trades.win_rate()
-    return {
-        "id": create_id("bt"),
-        "strategyId": strategy["id"],
-        "symbol": strategy["symbol"],
-        "interval": strategy["interval"],
-        "marketType": strategy["marketType"],
-        "startedAt": now_ms(),
-        "completedAt": now_ms(),
-        "source": "broker-historical",
-        "params": {"lookback": lookback, "initialCapital": initial_capital, "feeBps": fee_bps, "slippageBps": slippage_bps},
-        "metrics": {
-            "totalReturnPct": float(total_return) * 100 if total_return is not None else 0.0,
-            "sharpe": float(sharpe_ratio) if sharpe_ratio is not None else 0.0,
-            "maxDrawdownPct": float(max_drawdown) * 100 if max_drawdown is not None else 0.0,
-            "winRatePct": float(win_rate) * 100 if win_rate is not None else 0.0,
-            "trades": int(portfolio.trades.count()),
-            "endingEquity": float(value.iloc[-1]) if len(value) else initial_capital,
-        },
-        "equityCurve": [{"time": int(ts / 1000), "equity": float(eq)} for ts, eq in zip(frame["timestamp"].to_list(), value.tolist())],
-        "trades": serialize_trade_records(portfolio),
-    }
-
-
-def get_paper_account(user_id: str) -> dict[str, Any]:
-    state = db.read()
-    account = next((item for item in state["paperAccounts"] if item["userId"] == user_id), None)
-    if account:
-        return account
-    return {"id": create_id("paper"), "userId": user_id, "balanceUsd": 100000.0, "realizedPnl": 0.0, "positions": [], "updatedAt": now_ms()}
-
-
-def save_paper_account(account: dict[str, Any]) -> dict[str, Any]:
-    db.update(lambda current: {**current, "paperAccounts": [item for item in current["paperAccounts"] if item["id"] != account["id"]] + [account]})
-    return account
-
-
-def evaluate_pre_trade_risk(strategy: dict[str, Any], requested_notional: float, leverage: float) -> dict[str, Any]:
-    breaches: list[str] = []
-    if requested_notional > float(strategy["risk"]["maxNotional"]):
-        breaches.append("notional limit exceeded")
-    if leverage > float(strategy["risk"]["maxLeverage"]):
-        breaches.append("leverage limit exceeded")
-    return {"allow": not breaches, "breaches": breaches}
-
-
 def compile_python_strategy(source_code: str) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
     function_names: list[str] = []
     if not source_code.strip():
-        return {"valid": False, "errors": ["策略源码不能为空"], "warnings": warnings, "functions": function_names}
+        return {"valid": False, "errors": ["\u6e90\u7801\u4e0d\u80fd\u4e3a\u7a7a"], "warnings": warnings, "functions": function_names}
     try:
         tree = ast.parse(source_code, filename="<strategy>")
         compile(source_code, "<strategy>", "exec")
         function_names = [node.name for node in tree.body if isinstance(node, ast.FunctionDef)]
-        if "generate_signals" not in function_names:
-            errors.append("必须定义 generate_signals(frame, params) 函数")
-        if not any(isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom) for node in tree.body):
-            warnings.append("没有检测到 import 语句，通常建议显式导入 polars")
+        if "main" not in function_names:
+            errors.append("\u0046\u004d\u005a\u0020\u0050\u0079\u0074\u0068\u006f\u006e\u0020\u7b56\u7565\u5fc5\u987b\u5b9a\u4e49\u0020\u006d\u0061\u0069\u006e\u0028\u0029\u0020\u5165\u53e3\u51fd\u6570")
+        if "GetRecords" not in source_code:
+            warnings.append("\u6ca1\u6709\u68c0\u6d4b\u5230\u0020\u0047\u0065\u0074\u0052\u0065\u0063\u006f\u0072\u0064\u0073\u0020\u8c03\u7528\uff0c\u8bf7\u786e\u8ba4\u7b56\u7565\u662f\u5426\u6309\u0020\u0046\u004d\u005a\u0020\u884c\u60c5\u8bfb\u53d6\u65b9\u5f0f\u7f16\u5199")
+        if "exchange." not in source_code:
+            warnings.append("\u6ca1\u6709\u68c0\u6d4b\u5230\u0020\u0065\u0078\u0063\u0068\u0061\u006e\u0067\u0065\u002e\u0020\u5bf9\u8c61\u8c03\u7528\uff0c\u8bf7\u786e\u8ba4\u7b56\u7565\u662f\u5426\u6309\u0020\u0046\u004d\u005a\u0020\u4ea4\u6613\u63a5\u53e3\u7f16\u5199")
     except SyntaxError as exc:
-        errors.append(f"第 {exc.lineno} 行语法错误：{exc.msg}")
-    except Exception as exc:
-        errors.append(str(exc))
-    return {"valid": not errors, "errors": errors, "warnings": warnings, "functions": function_names}
-
-
-def compile_python_strategy(source_code: str) -> dict[str, Any]:
-    errors: list[str] = []
-    warnings: list[str] = []
-    function_names: list[str] = []
-    if not source_code.strip():
-        return {"valid": False, "errors": ["策略源码不能为空"], "warnings": warnings, "functions": function_names}
-    try:
-        tree = ast.parse(source_code, filename="<strategy>")
-        compile(source_code, "<strategy>", "exec")
-        function_names = [node.name for node in tree.body if isinstance(node, ast.FunctionDef)]
-        if "generate_signals" not in function_names:
-            errors.append("必须定义 generate_signals(frame, params) 函数")
-        if not any(isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom) for node in tree.body):
-            warnings.append("没有检测到 import 语句，通常建议显式导入 polars")
-    except SyntaxError as exc:
-        errors.append(f"第 {exc.lineno} 行语法错误：{exc.msg}")
+        errors.append(f"\u7b2c {exc.lineno} \u884c\u8bed\u6cd5\u9519\u8bef\uff1a{exc.msg}")
     except Exception as exc:
         errors.append(str(exc))
     return {"valid": not errors, "errors": errors, "warnings": warnings, "functions": function_names}
@@ -935,28 +848,33 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class CredentialRequest(BaseModel):
-    brokerTarget: str
-    label: str
-    apiKey: str
-    apiSecret: str
-    apiPassphrase: str | None = None
-
-
 class BacktestRequest(BaseModel):
     strategyId: str
-    lookback: int = Field(default=500, ge=100, le=1500)
-    initialCapital: float = 10000
-    feeBps: float = 4
-    slippageBps: float = 2
-
-
-class ExecutionRequest(BaseModel):
-    strategyId: str
-    brokerTarget: str = "paper"
-    side: Literal["BUY", "SELL"]
-    quantity: float | None = None
-    leverage: float = 1
+    brokerTarget: str = "binance:production"
+    startTime: str | None = "2025-01-01 00:00:00"
+    endTime: str | None = "2026-03-21 08:00:00"
+    period: str = "4h"
+    basePeriod: str = "1h"
+    mode: str = "模拟级"
+    initialCapital: float = Field(default=10000, gt=0)
+    quoteAsset: str = "USDT"
+    tolerancePct: float = Field(default=50, ge=0)
+    openFeePct: float = Field(default=0.03, ge=0)
+    closeFeePct: float = Field(default=0.03, ge=0)
+    slippagePoints: float = Field(default=0, ge=0)
+    candleLimit: int = Field(default=300, ge=10, le=5000)
+    chartDisplay: str = "显示"
+    depthMin: int = Field(default=20, ge=1)
+    depthMax: int = Field(default=200, ge=1)
+    recordEvents: bool = False
+    leverage: float | None = None
+    chartBars: int = Field(default=3000, ge=200, le=10000)
+    delayMs: int = Field(default=200, ge=0, le=5000)
+    logLimit: int = Field(default=8000, ge=100, le=50000)
+    profitLimit: int = Field(default=50000, ge=100, le=50000)
+    dataSource: str = "默认"
+    orderMode: str = "已成交"
+    distributor: str = "本地回测引擎: Python3 - 12 vCPU / 4G RAM"
 
 
 class StrategyRequest(BaseModel):
@@ -1023,7 +941,7 @@ def save_strategy(payload: StrategyRequest, authorization: str | None = Header(d
     if payload.template == "python":
         compiler = compile_python_strategy(payload.sourceCode or "")
         if not compiler["valid"]:
-            raise HTTPException(status_code=400, detail=f"Python 策略编译失败：{'；'.join(compiler['errors'])}")
+            raise HTTPException(status_code=400, detail=f"\u0046\u004d\u005a\u0020\u0050\u0079\u0074\u0068\u006f\u006e\u0020\u7b56\u7565\u7f16\u8bd1\u5931\u8d25\uff1a{'; '.join(compiler['errors'])}")
     strategy = {
         **payload.model_dump(),
         "sourceCode": payload.sourceCode if payload.template == "python" else None,
@@ -1046,27 +964,207 @@ def compile_strategy(payload: StrategyCompileRequest, authorization: str | None 
     return {**result, "checkedAt": now_ms()}
 
 
+def build_backtest_contract(payload: BacktestRequest, strategy: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], FmzBacktestConfig]:
+    effective_leverage = max(float(payload.leverage or strategy.get("risk", {}).get("maxLeverage") or 1), 1)
+    params = {
+        "strategyId": payload.strategyId,
+        "brokerTarget": payload.brokerTarget,
+        "startTime": payload.startTime,
+        "endTime": payload.endTime,
+        "period": payload.period,
+        "basePeriod": payload.basePeriod,
+        "mode": payload.mode,
+        "initialCapital": payload.initialCapital,
+        "quoteAsset": payload.quoteAsset,
+        "tolerancePct": payload.tolerancePct,
+        "openFeePct": payload.openFeePct,
+        "closeFeePct": payload.closeFeePct,
+        "slippagePoints": payload.slippagePoints,
+        "candleLimit": payload.candleLimit,
+        "chartDisplay": payload.chartDisplay,
+        "depthMin": payload.depthMin,
+        "depthMax": payload.depthMax,
+        "recordEvents": payload.recordEvents,
+        "chartBars": payload.chartBars,
+        "delayMs": payload.delayMs,
+        "logLimit": payload.logLimit,
+        "profitLimit": payload.profitLimit,
+        "dataSource": payload.dataSource,
+        "orderMode": payload.orderMode,
+        "distributor": payload.distributor,
+        "leverage": effective_leverage,
+        "symbol": strategy.get("symbol") or "ETHUSDT",
+        "marketType": strategy.get("marketType") or "futures",
+    }
+    engine_config = {
+        "brokerTarget": payload.brokerTarget,
+        "symbol": params["symbol"],
+        "marketType": params["marketType"],
+        "period": payload.period,
+        "basePeriod": payload.basePeriod,
+        "startTime": payload.startTime,
+        "endTime": payload.endTime,
+        "mode": payload.mode,
+        "quoteAsset": payload.quoteAsset,
+        "tolerancePct": payload.tolerancePct,
+        "candleLimit": payload.candleLimit,
+        "chartDisplay": payload.chartDisplay,
+        "depthMin": payload.depthMin,
+        "depthMax": payload.depthMax,
+        "recordEvents": payload.recordEvents,
+        "dataSource": payload.dataSource,
+        "orderMode": payload.orderMode,
+        "distributor": payload.distributor,
+        "leverage": effective_leverage,
+        "slippagePoints": payload.slippagePoints,
+        "logLimit": payload.logLimit,
+        "profitLimit": payload.profitLimit,
+        "chartBars": payload.chartBars,
+        "delayMs": payload.delayMs,
+        "initialCapital": payload.initialCapital,
+        "openFeePct": payload.openFeePct,
+        "closeFeePct": payload.closeFeePct,
+    }
+    config = FmzBacktestConfig(
+        strategy_id=payload.strategyId,
+        broker_target=payload.brokerTarget,
+        symbol=params["symbol"],
+        market_type=params["marketType"],
+        period=payload.period or strategy.get("interval") or "4h",
+        base_period=payload.basePeriod,
+        start_time=payload.startTime,
+        end_time=payload.endTime,
+        mode=payload.mode,
+        initial_capital=payload.initialCapital,
+        quote_asset=payload.quoteAsset,
+        tolerance_pct=payload.tolerancePct,
+        open_fee_pct=payload.openFeePct,
+        close_fee_pct=payload.closeFeePct,
+        slippage_points=payload.slippagePoints,
+        candle_limit=payload.candleLimit,
+        chart_display=payload.chartDisplay,
+        depth_min=payload.depthMin,
+        depth_max=payload.depthMax,
+        record_events=payload.recordEvents,
+        leverage=effective_leverage,
+        chart_bars=payload.chartBars,
+        delay_ms=payload.delayMs,
+        log_limit=payload.logLimit,
+        profit_limit=payload.profitLimit,
+        data_source=payload.dataSource,
+        order_mode=payload.orderMode,
+        distributor=payload.distributor,
+    )
+    return params, engine_config, config
+
+
 @app.get("/api/platform/backtests")
 def list_backtests(strategyId: str | None = None, authorization: str | None = Header(default=None)):
     require_user(authorization)
     state = db.read()
     runs = [item for item in state["backtests"] if not strategyId or item["strategyId"] == strategyId]
-    return sorted(runs, key=lambda item: item["completedAt"], reverse=True)
+    return sorted(runs, key=backtest_sort_key, reverse=True)
 
 
 @app.post("/api/platform/backtests")
-def run_backtest(payload: BacktestRequest, authorization: str | None = Header(default=None)):
-    user = require_user(authorization)
-    strategy = next((item for item in ensure_default_strategies() if item["id"] == payload.strategyId), None)
+async def run_backtest(payload: BacktestRequest, authorization: str | None = Header(default=None)):
+    actor = require_user(authorization)
+    strategy = next((item for item in list_strategies() if item["id"] == payload.strategyId), None)
     if not strategy:
-        raise HTTPException(status_code=404, detail="Strategy not found")
-    broker_target = get_default_execution_target(strategy["runtime"])
-    frame, source = fetch_ohlcv_frame(broker_target, strategy["marketType"], strategy["symbol"], strategy["interval"], payload.lookback)
-    run = run_vectorbt_backtest(strategy, frame, payload.lookback, payload.initialCapital, payload.feeBps, payload.slippageBps)
-    run["source"] = source
-    db.update(lambda current: {**current, "backtests": [run, *current["backtests"]][:100]})
-    audit_event(user["id"], "backtest.run", {"strategyId": strategy["id"], "runId": run["id"], "metrics": run["metrics"]})
-    return run
+        raise HTTPException(status_code=404, detail="未找到指定策略")
+    if strategy.get("template") != "python":
+        raise HTTPException(status_code=400, detail="当前仅支持 FMZ Python 策略回测")
+
+    queued_at = now_ms()
+    params, engine_config, _ = build_backtest_contract(payload, strategy)
+    result = {
+        "id": create_id("bt"),
+        "strategyId": payload.strategyId,
+        "source": "fmz-official-local",
+        "status": "queued",
+        "progressPct": 0,
+        "queuedAt": queued_at,
+        "startedAt": None,
+        "completedAt": None,
+        "updatedAt": queued_at,
+        "errorMessage": None,
+        "params": params,
+        "engineConfig": engine_config,
+        "metrics": {
+            "totalReturnPct": 0.0,
+            "sharpe": 0.0,
+            "maxDrawdownPct": 0.0,
+            "winRatePct": 0.0,
+            "trades": 0,
+            "endingEquity": payload.initialCapital,
+        },
+        "equityCurve": [],
+        "trades": [],
+        "marketRows": [],
+        "logs": [],
+        "assetRows": [],
+        "statusInfo": {
+            "backtestStatus": 0,
+            "finished": False,
+            "progress": 0,
+            "logsCount": 0,
+            "loadBytes": 0,
+            "loadElapsed": 0,
+            "elapsed": 0,
+            "lastPrice": 0,
+            "equity": payload.initialCapital,
+            "utilization": 0,
+            "longAmount": 0,
+            "shortAmount": 0,
+            "estimatedProfit": 0,
+            "tradeCount": 0,
+            "mode": payload.mode,
+            "quoteAsset": payload.quoteAsset,
+            "tolerancePct": payload.tolerancePct,
+            "candleLimit": payload.candleLimit,
+            "chartDisplay": payload.chartDisplay,
+            "depthMin": payload.depthMin,
+            "depthMax": payload.depthMax,
+            "recordEvents": payload.recordEvents,
+            "leverage": params["leverage"],
+            "chartBars": payload.chartBars,
+            "delayMs": payload.delayMs,
+            "logLimit": payload.logLimit,
+            "profitLimit": payload.profitLimit,
+            "dataSource": payload.dataSource,
+            "orderMode": payload.orderMode,
+        },
+        "summary": {
+            "barCount": 0,
+            "orderCount": 0,
+            "dataSource": "fmz-official-local-engine",
+            "startedAtText": payload.startTime,
+            "endedAtText": payload.endTime,
+            "durationMs": 0,
+            "period": payload.period,
+            "basePeriod": payload.basePeriod,
+            "mode": payload.mode,
+            "quoteAsset": payload.quoteAsset,
+            "tolerancePct": payload.tolerancePct,
+            "candleLimit": payload.candleLimit,
+            "chartDisplay": payload.chartDisplay,
+            "depthMin": payload.depthMin,
+            "depthMax": payload.depthMax,
+            "recordEvents": payload.recordEvents,
+            "leverage": params["leverage"],
+            "chartBars": payload.chartBars,
+            "delayMs": payload.delayMs,
+            "logLimit": payload.logLimit,
+            "profitLimit": payload.profitLimit,
+            "orderMode": payload.orderMode,
+        },
+    }
+    state = db.read()
+    state["backtests"] = [result, *state["backtests"]][:200]
+    db.write(state)
+    audit_event(actor["id"], "backtest.run.queued", {"strategyId": payload.strategyId, "brokerTarget": payload.brokerTarget, "runId": result["id"]})
+    start_backtest_job(result["id"], actor["id"], strategy, payload)
+    return result
 
 
 @app.get("/api/platform/runtime/connectivity")
@@ -1074,7 +1172,7 @@ def runtime_connectivity(authorization: str | None = Header(default=None)):
     require_user(authorization)
     proxy_summary = get_proxy_runtime_summary()
     broker_checks: list[dict[str, Any]] = []
-    for broker_target in ("okx:sandbox", "binance:sandbox"):
+    for broker_target in ("okx:sandbox", "binance:sandbox", "binance:production", "okx:production"):
         try:
             broker_checks.append(measure_broker_latency(broker_target))
         except Exception as exc:
@@ -1120,79 +1218,10 @@ def runtime_config(authorization: str | None = Header(default=None)):
     }
 
 
-@app.get("/api/platform/credentials")
-def credentials(authorization: str | None = Header(default=None)):
-    user = require_user(authorization)
-    return [{"id": item["id"], "label": item["label"], "brokerTarget": item["brokerTarget"], "updatedAt": item["updatedAt"]} for item in list_credentials(user["id"])]
-
-
-@app.post("/api/platform/credentials")
-def create_credential(payload: CredentialRequest, authorization: str | None = Header(default=None)):
-    user = require_user(authorization)
-    items = save_credential(user["id"], payload.brokerTarget, payload.label, payload.apiKey, payload.apiSecret, payload.apiPassphrase)
-    audit_event(user["id"], "secret.saved", {"brokerTarget": payload.brokerTarget, "label": payload.label})
-    return [{"id": item["id"], "label": item["label"], "brokerTarget": item["brokerTarget"], "updatedAt": item["updatedAt"]} for item in items]
-
-
 @app.get("/api/platform/audit")
 def audit(authorization: str | None = Header(default=None)):
     user = require_user(authorization)
     return list_audit_events(user["id"])
-
-
-@app.get("/api/platform/paper-account")
-def paper_account(authorization: str | None = Header(default=None)):
-    user = require_user(authorization)
-    return get_paper_account(user["id"])
-
-
-@app.post("/api/platform/execution")
-def execute(payload: ExecutionRequest, authorization: str | None = Header(default=None)):
-    user = require_user(authorization)
-    strategy = next((item for item in ensure_default_strategies() if item["id"] == payload.strategyId), None)
-    if not strategy:
-        raise HTTPException(status_code=404, detail="Strategy not found")
-
-    broker_id, broker_mode, normalized_target = parse_broker_target(payload.brokerTarget or get_default_execution_target(strategy["runtime"]))
-    data_target = normalized_target if normalized_target != "paper" else "binance:sandbox"
-    frame, _ = fetch_ohlcv_frame(data_target, strategy["marketType"], strategy["symbol"], strategy["interval"], 3)
-    last_close = float(frame["close"].to_list()[-1])
-    quantity = payload.quantity or float(strategy["parameters"].get("positionSizeUsd", 1000)) / max(last_close, 1e-8)
-    requested_notional = quantity * last_close
-    risk = evaluate_pre_trade_risk(strategy, requested_notional, payload.leverage)
-    if not risk["allow"]:
-        audit_event(user["id"], "execution.rejected", {"strategyId": strategy["id"], "brokerTarget": normalized_target, "breaches": risk["breaches"]})
-        return {"accepted": False, "brokerTarget": normalized_target, "risk": risk}
-
-    audit_event(user["id"], "execution.accepted", {"strategyId": strategy["id"], "brokerTarget": normalized_target, "side": payload.side, "quantity": quantity})
-    if normalized_target == "paper":
-        account = get_paper_account(user["id"])
-        existing = next((item for item in account["positions"] if item["symbol"] == strategy["symbol"] and item["marketType"] == strategy["marketType"]), None)
-        positions = [item for item in account["positions"] if not (item["symbol"] == strategy["symbol"] and item["marketType"] == strategy["marketType"])]
-        next_qty = (existing["quantity"] if existing else 0.0) + (quantity if payload.side == "BUY" else -quantity)
-        if abs(next_qty) > 1e-8:
-            positions.append({"symbol": strategy["symbol"], "marketType": strategy["marketType"], "quantity": next_qty, "avgEntryPrice": last_close, "updatedAt": now_ms()})
-        account["positions"] = positions
-        account["balanceUsd"] = float(account["balanceUsd"]) - (requested_notional if payload.side == "BUY" else -requested_notional)
-        account["updatedAt"] = now_ms()
-        save_paper_account(account)
-        result = {"accepted": True, "brokerTarget": "paper", "broker": "Paper", "fillPrice": last_close, "quantity": quantity, "updatedAccount": account}
-        audit_event(user["id"], "execution.sent", result)
-        return result
-
-    credentials_map = resolve_broker_credentials(user["id"], normalized_target)
-    if not credentials_map:
-        raise HTTPException(status_code=400, detail=f"Missing broker credentials for {normalized_target}")
-    client = create_exchange_client(broker_id, strategy["marketType"], credentials_map, broker_mode)
-    market_symbol = resolve_market_symbol(client, broker_id, strategy["marketType"], strategy["symbol"])
-    try:
-        extra_params = {"tdMode": "cross"} if broker_id == "okx" and strategy["marketType"] != "spot" else {}
-        order = client.create_order(market_symbol, "market", payload.side.lower(), float(quantity), None, extra_params)
-    except Exception as error:
-        raise HTTPException(status_code=502, detail=str(error)) from error
-    result = {"accepted": True, "brokerTarget": normalized_target, "broker": get_broker_label(normalized_target), "orderResult": order}
-    audit_event(user["id"], "execution.sent", {"strategyId": strategy["id"], "brokerTarget": normalized_target, "orderResult": order})
-    return result
 
 
 @app.get("/research/modules")
@@ -1200,7 +1229,8 @@ def research_modules(authorization: str | None = Header(default=None)):
     require_user(authorization)
     return [
         {"id": "research", "label": "Research", "capabilities": ["strategy registry", "factor research", "alpha experiments"]},
-        {"id": "simulation", "label": "Simulation", "capabilities": ["vectorbt backtests", "parameter sweeps", "historical replay"]},
+        {"id": "simulation", "label": "Local Validation", "capabilities": ["local backtests", "parameter sweeps", "historical replay"]},
+        {"id": "operations", "label": "Operations", "capabilities": ["network checks", "deployment checklist", "runtime visibility"]},
     ]
 
 
@@ -1224,34 +1254,13 @@ def research_backtests(strategyId: str | None = None, authorization: str | None 
 @app.get("/portfolio/modules")
 def portfolio_modules(authorization: str | None = Header(default=None)):
     require_user(authorization)
-    return [{"id": "portfolio", "label": "Portfolio", "capabilities": ["paper accounts", "allocation views", "exposure oversight"]}]
-
-
-@app.get("/portfolio/account")
-def portfolio_account(authorization: str | None = Header(default=None)):
-    return paper_account(authorization)
+    return [{"id": "portfolio", "label": "Portfolio", "capabilities": ["allocation views", "exposure oversight", "runtime mix"]}]
 
 
 @app.get("/governance/modules")
 def governance_modules(authorization: str | None = Header(default=None)):
     require_user(authorization)
-    return [{"id": "governance", "label": "Governance", "capabilities": ["credential storage", "audit trail", "broker controls"]}]
-
-
-@app.get("/governance/brokers")
-def governance_brokers(authorization: str | None = Header(default=None)):
-    require_user(authorization)
-    return BROKER_SUMMARIES
-
-
-@app.get("/governance/credentials")
-def governance_credentials(authorization: str | None = Header(default=None)):
-    return credentials(authorization)
-
-
-@app.post("/governance/credentials")
-def governance_create_credential(payload: CredentialRequest, authorization: str | None = Header(default=None)):
-    return create_credential(payload, authorization)
+    return [{"id": "governance", "label": "Governance", "capabilities": ["audit trail", "configuration review", "runtime controls"]}]
 
 
 @app.get("/governance/audit")

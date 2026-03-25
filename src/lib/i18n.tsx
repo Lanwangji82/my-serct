@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState } from "react";
+﻿import React, { createContext, useContext, useState } from "react";
 
 type Language = "en" | "zh";
 
@@ -11,7 +11,7 @@ const en = {
   strategies: "Strategies",
   portfolio: "Portfolio",
   settings: "Settings",
-  searchPlaceholder: "Search strategies, brokers, settings...",
+  searchPlaceholder: "Search strategies, research, settings...",
   status: "Status",
   systemsOperational: "Systems operational",
   adminUser: "Local Admin",
@@ -56,11 +56,11 @@ const zh: typeof en = {
   research: "研究",
   governance: "治理",
   dataCenter: "数据中心",
-  backtesting: "回测",
+  backtesting: "回测中心",
   strategies: "策略",
   portfolio: "组合",
   settings: "设置",
-  searchPlaceholder: "搜索策略、券商、设置...",
+  searchPlaceholder: "搜索策略、研究、配置项...",
   status: "状态",
   systemsOperational: "系统运行正常",
   adminUser: "本地管理员",

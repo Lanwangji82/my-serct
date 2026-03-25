@@ -42,10 +42,15 @@ async function waitForPlatformReady(timeoutMs = PLATFORM_READY_TIMEOUT_MS) {
 const children: ChildProcess[] = [];
 
 async function main() {
-  const platformService = runScript('service:py-platform');
-  children.push(platformService);
+  const alreadyReady = await waitForPlatformReady(1500);
+  if (!alreadyReady) {
+    const platformService = runScript('service:py-platform');
+    children.push(platformService);
+  } else {
+    console.info('[dev-runner] reusing existing python platform service');
+  }
 
-  const platformReady = await waitForPlatformReady();
+  const platformReady = alreadyReady || (await waitForPlatformReady());
   if (!platformReady) {
     console.warn('[dev-runner] python platform service did not report ready within 20s, starting Vite anyway');
   }
