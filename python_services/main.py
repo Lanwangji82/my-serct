@@ -236,6 +236,7 @@ def invalidate_state_caches() -> None:
     redis_cache.clear_prefix("strategies:")
     redis_cache.clear_prefix("backtests:")
     redis_cache.clear_prefix("audit:")
+    redis_cache.clear_prefix("sessions:")
     redis_cache.delete("runtime:connectivity")
 
 
@@ -273,14 +274,16 @@ class MongoDb:
 
     def _ensure_indexes(self) -> None:
         self.database["strategies"].create_index("id", unique=True)
-        self.database["strategies"].create_index("updatedAt")
+        self.database["strategies"].create_index([("updatedAt", -1)])
         self.database["backtests"].create_index("id", unique=True)
-        self.database["backtests"].create_index("strategyId")
-        self.database["backtests"].create_index("startedAt")
+        self.database["backtests"].create_index([("strategyId", 1), ("updatedAt", -1)])
+        self.database["backtests"].create_index([("updatedAt", -1)])
+        self.database["backtests"].create_index([("status", 1), ("updatedAt", -1)])
+        self.database["backtests"].create_index([("startedAt", -1)])
         self.database["audit_events"].create_index("id", unique=True)
         self.database["audit_events"].create_index([("actorUserId", 1), ("createdAt", -1)])
         self.database["sessions"].create_index("token", unique=True)
-        self.database["sessions"].create_index("expiresAt")
+        self.database["sessions"].create_index("expiresAt", expireAfterSeconds=0)
         self.database["users"].create_index("id", unique=True)
         self.database["users"].create_index("email", unique=True)
 
@@ -312,6 +315,37 @@ class MongoDb:
             items = state.get(field) or []
             if items:
                 collection.insert_many([{**item, "_id": item.get("id") or f"{field}-{index}"} for index, item in enumerate(items)], ordered=False)
+
+    def list_collection(self, field: str, *, sort: list[tuple[str, int]] | None = None, limit: int | None = None, filter_query: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        collection = self.database[self.collection_names[field]]
+        cursor = collection.find(filter_query or {}, {"_id": 0})
+        if sort:
+            cursor = cursor.sort(sort)
+        if limit is not None:
+            cursor = cursor.limit(limit)
+        return list(cursor)
+
+    def find_one(self, field: str, filter_query: dict[str, Any]) -> dict[str, Any] | None:
+        item = self.database[self.collection_names[field]].find_one(filter_query, {"_id": 0})
+        return item
+
+    def upsert_one(self, field: str, item: dict[str, Any], *, key: str = "id") -> None:
+        collection = self.database[self.collection_names[field]]
+        item_id = item.get(key)
+        if not item_id:
+            raise ValueError(f"{field} 缺少主键 {key}")
+        collection.replace_one({key: item_id}, {**item, "_id": item_id}, upsert=True)
+        invalidate_state_caches()
+
+    def append_one(self, field: str, item: dict[str, Any], *, key: str = "id") -> None:
+        self.upsert_one(field, item, key=key)
+
+    def replace_collection(self, field: str, items: list[dict[str, Any]], *, key: str = "id") -> None:
+        collection = self.database[self.collection_names[field]]
+        collection.delete_many({})
+        if items:
+            collection.insert_many([{**item, "_id": item.get(key) or f"{field}-{index}"} for index, item in enumerate(items)], ordered=False)
+        invalidate_state_caches()
 
 
 def create_storage_backend():
@@ -516,9 +550,14 @@ def prune_missing_strategy_artifacts(strategies: list[dict[str, Any]]) -> list[d
 
 
 def ensure_bootstrap_user() -> dict[str, Any]:
-    state = db.read()
-    if state["users"]:
-        return state["users"][0]
+    if isinstance(db, MongoDb):
+        existing = db.list_collection("users", limit=1)
+        if existing:
+            return existing[0]
+    else:
+        state = db.read()
+        if state["users"]:
+            return state["users"][0]
     user = {
         "id": create_id("user"),
         "email": os.getenv("AUTH_BOOTSTRAP_EMAIL", "admin@quantx.local").strip().lower(),
@@ -526,19 +565,29 @@ def ensure_bootstrap_user() -> dict[str, Any]:
         "roles": ["admin", "trader"],
         "createdAt": now_ms(),
     }
-    db.update(lambda current: {**current, "users": [user, *current["users"]]})
+    if isinstance(db, MongoDb):
+        db.upsert_one("users", user)
+    else:
+        db.update(lambda current: {**current, "users": [user, *current["users"]]})
     return user
 
 
 def list_strategies() -> list[dict[str, Any]]:
     def load() -> list[dict[str, Any]]:
-        state = db.read()
-        strategies = prune_missing_strategy_artifacts([normalize_strategy_record(item) for item in state["strategies"]])
-        if strategies != state["strategies"]:
-            db.write({**state, "strategies": strategies})
+        if isinstance(db, MongoDb):
+            raw_items = db.list_collection("strategies", sort=[("updatedAt", -1)])
+        else:
+            raw_items = db.read()["strategies"]
+        strategies = prune_missing_strategy_artifacts([normalize_strategy_record(item) for item in raw_items])
+        if strategies != raw_items:
+            if isinstance(db, MongoDb):
+                db.replace_collection("strategies", strategies)
+            else:
+                state = db.read()
+                db.write({**state, "strategies": strategies})
         return sorted(strategies, key=lambda item: item["updatedAt"], reverse=True)
 
-    return cached_json("strategies:list", 3000, load)
+    return cached_json("strategies:list", 10_000, load)
 
 
 def get_strategy_summary(strategy: dict[str, Any]) -> dict[str, Any]:
@@ -631,11 +680,17 @@ def require_user(authorization: str | None) -> dict[str, Any]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing session token")
     token = authorization[7:].strip()
-    state = db.read()
-    session = next((item for item in state["sessions"] if item["token"] == token and item["expiresAt"] > now_ms()), None)
+    if isinstance(db, MongoDb):
+        session = db.find_one("sessions", {"token": token, "expiresAt": {"$gt": now_ms()}})
+    else:
+        state = db.read()
+        session = next((item for item in state["sessions"] if item["token"] == token and item["expiresAt"] > now_ms()), None)
     if not session:
         raise HTTPException(status_code=401, detail="Session expired or invalid")
-    user = next((item for item in state["users"] if item["id"] == session["userId"]), None)
+    if isinstance(db, MongoDb):
+        user = db.find_one("users", {"id": session["userId"]})
+    else:
+        user = next((item for item in state["users"] if item["id"] == session["userId"]), None)
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     return sanitize_user(user)
@@ -649,15 +704,25 @@ def audit_event(actor_user_id: str, event_type: str, payload: dict[str, Any]) ->
         "createdAt": now_ms(),
         "payload": payload,
     }
-    db.update(lambda current: {**current, "auditEvents": [event, *current["auditEvents"]][:500]})
+    if isinstance(db, MongoDb):
+        db.append_one("auditEvents", event)
+        items = db.list_collection("auditEvents", sort=[("createdAt", -1)])
+        if len(items) > 500:
+            db.replace_collection("auditEvents", items[:500])
+    else:
+        db.update(lambda current: {**current, "auditEvents": [event, *current["auditEvents"]][:500]})
     return event
 
 
 def list_audit_events(user_id: str) -> list[dict[str, Any]]:
     return cached_json(
         f"audit:{user_id}",
-        2000,
-        lambda: sorted([item for item in db.read()["auditEvents"] if item["actorUserId"] == user_id], key=lambda item: item["createdAt"], reverse=True),
+        5000,
+        lambda: (
+            db.list_collection("auditEvents", sort=[("createdAt", -1)], limit=500, filter_query={"actorUserId": user_id})
+            if isinstance(db, MongoDb)
+            else sorted([item for item in db.read()["auditEvents"] if item["actorUserId"] == user_id], key=lambda item: item["createdAt"], reverse=True)
+        ),
     )
 
 
@@ -731,11 +796,14 @@ def strip_backtest_details(item: dict[str, Any]) -> dict[str, Any]:
 
 def find_backtest_run(run_id: str) -> dict[str, Any] | None:
     def load() -> dict[str, Any] | None:
-        state = db.read()
-        summary = next((item for item in state["backtests"] if item["id"] == run_id), None)
+        if isinstance(db, MongoDb):
+            summary = db.find_one("backtests", {"id": run_id})
+        else:
+            state = db.read()
+            summary = next((item for item in state["backtests"] if item["id"] == run_id), None)
         return merge_backtest_record(summary) if summary else None
 
-    return cached_json(f"backtests:detail:{run_id}", 1500, load)
+    return cached_json(f"backtests:detail:{run_id}", 5000, load)
 
 
 def migrate_backtests_to_file_store() -> None:
@@ -805,6 +873,17 @@ migrate_backtests_to_file_store()
 
 
 def update_backtest_run(run_id: str, updater):
+    if isinstance(db, MongoDb):
+        summary = db.find_one("backtests", {"id": run_id})
+        if not summary:
+            return
+        merged = merge_backtest_record(summary)
+        next_item = updater(dict(merged))
+        next_summary, details = split_backtest_record(next_item)
+        write_backtest_details(run_id, details)
+        db.upsert_one("backtests", next_summary)
+        return
+
     def mutate(current: dict[str, Any]) -> dict[str, Any]:
         runs: list[dict[str, Any]] = []
         for item in current["backtests"]:
@@ -1103,12 +1182,19 @@ def health():
 @app.post("/api/platform/auth/login")
 def login(payload: LoginRequest):
     ensure_bootstrap_user()
-    state = db.read()
-    user = next((item for item in state["users"] if item["email"] == payload.email.strip().lower()), None)
+    if isinstance(db, MongoDb):
+        user = db.find_one("users", {"email": payload.email.strip().lower()})
+    else:
+        state = db.read()
+        user = next((item for item in state["users"] if item["email"] == payload.email.strip().lower()), None)
     if not user or user["passwordHash"] != sha256(payload.password):
         raise HTTPException(status_code=401, detail="Invalid email or password")
     session = {"token": create_id("sess"), "userId": user["id"], "createdAt": now_ms(), "expiresAt": now_ms() + SESSION_TTL_MS}
-    db.update(lambda current: {**current, "sessions": [item for item in current["sessions"] if item["expiresAt"] > now_ms()] + [session]})
+    if isinstance(db, MongoDb):
+        sessions = db.list_collection("sessions", filter_query={"expiresAt": {"$gt": now_ms()}}, sort=[("createdAt", -1)], limit=200)
+        db.replace_collection("sessions", [*sessions, session])
+    else:
+        db.update(lambda current: {**current, "sessions": [item for item in current["sessions"] if item["expiresAt"] > now_ms()] + [session]})
     audit_event(user["id"], "auth.login", {"email": user["email"]})
     return {"session": session, "user": sanitize_user(user)}
 
@@ -1151,7 +1237,10 @@ def save_strategy(payload: StrategyRequest, authorization: str | None = Header(d
     artifact_summary = ensure_strategy_artifact(strategy)
     if artifact_summary:
         strategy["artifactSummary"] = artifact_summary
-    db.update(lambda current: {**current, "strategies": [item for item in current["strategies"] if item["id"] != strategy["id"]] + [strategy]})
+    if isinstance(db, MongoDb):
+        db.upsert_one("strategies", strategy)
+    else:
+        db.update(lambda current: {**current, "strategies": [item for item in current["strategies"] if item["id"] != strategy["id"]] + [strategy]})
     return get_strategy_summary(strategy)
 
 
@@ -1264,17 +1353,22 @@ def list_backtests(
     authorization: str | None = Header(default=None),
 ):
     require_user(authorization)
-    cache_key = f"backtests:list:{strategyId or 'all'}:{int(bool(includeDetails))}:{max(1, min(limit, 200))}"
+    normalized_limit = max(1, min(limit, 200))
+    cache_key = f"backtests:list:{strategyId or 'all'}:{int(bool(includeDetails))}:{normalized_limit}"
 
     def load():
-        state = db.read()
-        runs = [item for item in state["backtests"] if not strategyId or item["strategyId"] == strategyId]
-        sorted_runs = sorted(runs, key=backtest_sort_key, reverse=True)[: max(1, min(limit, 200))]
+        if isinstance(db, MongoDb):
+            filter_query = {"strategyId": strategyId} if strategyId else {}
+            sorted_runs = db.list_collection("backtests", sort=[("updatedAt", -1)], limit=normalized_limit, filter_query=filter_query)
+        else:
+            state = db.read()
+            runs = [item for item in state["backtests"] if not strategyId or item["strategyId"] == strategyId]
+            sorted_runs = sorted(runs, key=backtest_sort_key, reverse=True)[: normalized_limit]
         if includeDetails:
             return [merge_backtest_record(item) for item in sorted_runs]
         return [strip_backtest_details(item) for item in sorted_runs]
 
-    return cached_json(cache_key, 1500, load)
+    return cached_json(cache_key, 5000 if not includeDetails else 2000, load)
 
 
 @app.get("/api/platform/backtests/{run_id}")
@@ -1390,7 +1484,10 @@ async def run_backtest(payload: BacktestRequest, authorization: str | None = Hea
     }
     summary, details = split_backtest_record(result)
     write_backtest_details(summary["id"], details)
-    db.update(lambda current: {**current, "backtests": [summary, *current["backtests"]][:200]})
+    if isinstance(db, MongoDb):
+        db.upsert_one("backtests", summary)
+    else:
+        db.update(lambda current: {**current, "backtests": [summary, *current["backtests"]][:200]})
     audit_event(actor["id"], "backtest.run.queued", {"strategyId": payload.strategyId, "brokerTarget": payload.brokerTarget, "runId": result["id"]})
     start_backtest_job(result["id"], actor["id"], strategy, payload)
     return strip_backtest_details(summary)

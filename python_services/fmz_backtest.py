@@ -3,14 +3,18 @@ from __future__ import annotations
 import json
 import math
 import re
+import os
 import subprocess
 import sys
 import tempfile
 import time
 from bisect import bisect_left
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import dataclass
 from datetime import datetime
+from io import StringIO
 from pathlib import Path
+from threading import current_thread, main_thread
 from typing import Any, Callable
 from urllib.parse import urlencode
 
@@ -906,6 +910,21 @@ def _run_fmz_backtest_direct(source_code: str, config: BacktestConfig) -> dict[s
 
 
 def run_fmz_backtest(source_code: str, config: BacktestConfig, progress_callback: Callable[[int, str], None] | None = None) -> dict[str, Any]:
+    execution_mode = (os.getenv("PY_PLATFORM_FMZ_EXECUTION_MODE") or "inline").strip().lower()
+    can_inline = current_thread() is main_thread()
+    if execution_mode != "subprocess" and can_inline:
+        if progress_callback:
+            progress_callback(10, "FMZ 本地回测引擎启动中")
+        stdout_buffer = StringIO()
+        stderr_buffer = StringIO()
+        with redirect_stdout(stdout_buffer), redirect_stderr(stderr_buffer):
+            if progress_callback:
+                progress_callback(18, "FMZ 引擎运行中")
+            result = _run_fmz_backtest_direct(source_code, config)
+        if progress_callback:
+            progress_callback(95, "正在解析回测结果")
+        return result
+
     payload = {
         "source_code": source_code,
         "config": {
