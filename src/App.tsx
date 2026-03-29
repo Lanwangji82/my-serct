@@ -3,9 +3,8 @@ import { AppLayout } from "./components/Layout";
 import { AlertProvider } from "./lib/AlertContext";
 import { LanguageProvider } from "./lib/i18n";
 import { ToastContainer } from "./components/NotificationCenter";
-import { GovernanceWorkspace } from "./components/GovernanceWorkspace";
-import { PortfolioWorkspace } from "./components/PortfolioWorkspace";
-import { ResearchWorkspace } from "./components/ResearchWorkspace";
+import { MarketWorkspace } from "./components/MarketWorkspace";
+import { MarketIntelligenceWorkspace } from "./components/MarketIntelligenceWorkspace";
 import { RuntimeErrorBoundary } from "./components/RuntimeErrorBoundary";
 import { StrategyWorkbench } from "./components/StrategyWorkbench";
 import { Badge, Button, Card, Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "./components/ui";
@@ -15,6 +14,10 @@ import {
   formatMoney,
   PLATFORM_API_BASE,
   type BrokerRegistrySummary,
+  type NetworkClientCatalogEntry,
+  type NetworkClientId,
+  type NetworkRouteCatalogEntry,
+  type RuntimeConfig,
 } from "./lib/platform-client";
 
 type StrategySummary = {
@@ -69,23 +72,6 @@ type Connectivity = {
   };
   brokers?: ConnectivityBroker[];
   checkedAt?: number;
-};
-
-type RuntimeConfig = {
-  appPort: number;
-  localMode: boolean;
-  databasePath: string;
-  strategyStoreRoot: string;
-  proxy: {
-    configured: boolean;
-    mode?: string;
-    source?: string;
-    activeProxy?: string;
-    httpProxy?: string;
-    httpsProxy?: string;
-    socksProxy?: string;
-  };
-  checkedAt: number;
 };
 
 type Snapshot = ReturnType<typeof usePlatformSnapshot>;
@@ -143,6 +129,21 @@ function usePlatformSnapshot() {
     });
   };
 
+  const saveNetworkClients = async (payload: RuntimeConfig["networkClients"]) => {
+    const nextRuntime = await authorizedFetch<RuntimeConfig>(`${PLATFORM_API_BASE}/runtime/network-clients`, "", {
+      method: "POST",
+      body: JSON.stringify(payload),
+    });
+    setRuntimeConfig(nextRuntime);
+    setConnectivity((current) => ({
+      ...(current || {}),
+      proxy: nextRuntime.proxy,
+      checkedAt: Date.now(),
+    }));
+    setStatus("网络端口配置已保存");
+    return nextRuntime;
+  };
+
   return {
     user,
     brokers,
@@ -154,6 +155,7 @@ function usePlatformSnapshot() {
     status,
     reload,
     mergeConnectivityBroker,
+    saveNetworkClients,
   };
 }
 
@@ -520,10 +522,258 @@ function BacktestingView(props: Snapshot & { onOpenStrategies: () => void }) {
 }
 
 function SettingsView(props: Snapshot) {
+  const [ports, setPorts] = useState<Record<NetworkClientId, string>>({
+    auto: "",
+    jp: "",
+    sg: "",
+    us: "",
+    hk: "",
+    direct: "",
+  });
+  const [routes, setRoutes] = useState<Record<string, NetworkClientId>>({});
+  const [saving, setSaving] = useState(false);
+  const [saveMessage, setSaveMessage] = useState("");
+  const [tushareEnabled, setTushareEnabled] = useState(false);
+  const [tushareToken, setTushareToken] = useState("");
+  const [tushareBaseUrl, setTushareBaseUrl] = useState("http://api.tushare.pro");
+  const [tushareSaving, setTushareSaving] = useState(false);
+  const [tushareValidating, setTushareValidating] = useState(false);
+  const [tushareMessage, setTushareMessage] = useState("");
+  const [tushareValidationStatus, setTushareValidationStatus] = useState<{ ok: boolean; checkedAt: number } | null>(null);
+  const [llmEnabled, setLlmEnabled] = useState(false);
+  const [llmProvider, setLlmProvider] = useState("openai");
+  const [llmApiKey, setLlmApiKey] = useState("");
+  const [llmBaseUrl, setLlmBaseUrl] = useState("https://api.openai.com/v1");
+  const [llmModel, setLlmModel] = useState("gpt-5.4-mini");
+  const [llmSaving, setLlmSaving] = useState(false);
+  const [llmValidating, setLlmValidating] = useState(false);
+  const [llmMessage, setLlmMessage] = useState("");
+  const [llmValidationStatus, setLlmValidationStatus] = useState<{ ok: boolean; checkedAt: number } | null>(null);
+  const llmProviderOptions = [
+    { value: "openai", label: "OpenAI", baseUrl: "https://api.openai.com/v1", model: "gpt-5.4-mini" },
+    { value: "zhipu", label: "智谱 AI", baseUrl: "https://open.bigmodel.cn/api/paas/v4", model: "glm-4.5" },
+  ] as const;
+
+  useEffect(() => {
+    const config = props.runtimeConfig?.networkClients;
+    if (!config) return;
+    setPorts({
+      auto: String(config.clients.auto.port),
+      jp: String(config.clients.jp.port),
+      sg: String(config.clients.sg.port),
+      us: String(config.clients.us.port),
+      hk: String(config.clients.hk.port),
+      direct: String(config.clients.direct.port),
+    });
+    setRoutes(config.routes);
+  }, [props.runtimeConfig]);
+
+  useEffect(() => {
+    const tushare = props.runtimeConfig?.dataProviders?.tushare;
+    if (!tushare) return;
+    setTushareEnabled(tushare.enabled);
+    setTushareBaseUrl(tushare.baseUrl || "http://api.tushare.pro");
+    setTushareToken("");
+    setTushareMessage(tushare.status?.message || (tushare.configured ? "已配置 Tushare Token。" : "尚未配置 Tushare Token。"));
+    if (tushare.status) {
+      setTushareValidationStatus({
+        ok: Boolean(tushare.status.ok),
+        checkedAt: Number(tushare.status.checkedAt || 0),
+      });
+    }
+  }, [props.runtimeConfig]);
+
+  useEffect(() => {
+    const llm = props.runtimeConfig?.dataProviders?.llm;
+    if (!llm) return;
+    setLlmEnabled(llm.enabled);
+    setLlmProvider(llm.provider || "openai");
+    setLlmBaseUrl(llm.baseUrl || "https://api.openai.com/v1");
+    setLlmModel(llm.model || "gpt-5.4-mini");
+    setLlmApiKey("");
+    setLlmMessage(llm.status?.message || (llm.configured ? "已配置 LLM API。" : "未配置 LLM API，将使用系统规则过滤。"));
+    if (llm.status) {
+      setLlmValidationStatus({
+        ok: Boolean(llm.status.ok),
+        checkedAt: Number(llm.status.checkedAt || 0),
+      });
+    }
+  }, [props.runtimeConfig]);
+
+  const handleChangeLlmProvider = (value: string) => {
+    const next = llmProviderOptions.find((item) => item.value === value);
+    setLlmProvider(value);
+    if (next) {
+      setLlmBaseUrl(next.baseUrl);
+      setLlmModel(next.model);
+    }
+  };
+
+  const clientRows: NetworkClientCatalogEntry[] =
+    props.runtimeConfig?.networkClientCatalog ||
+    props.runtimeConfig?.networkClients.clientCatalog ||
+    [];
+  const routeRows: NetworkRouteCatalogEntry[] =
+    props.runtimeConfig?.networkRouteCatalog ||
+    props.runtimeConfig?.networkClients.routeCatalog ||
+    [];
+
+  const handleSave = async () => {
+    setSaveMessage("");
+    const normalized = Object.fromEntries(
+      Object.entries(ports).map(([key, value]) => [key, Number(value)])
+    ) as Record<keyof typeof ports, number>;
+
+    if (Object.values(normalized).some((value) => !Number.isInteger(value) || value <= 0 || value > 65535)) {
+      setSaveMessage("端口必须是 1 到 65535 之间的整数。");
+      return;
+    }
+
+    setSaving(true);
+    try {
+      await props.saveNetworkClients({
+        clients: {
+          auto: { port: normalized.auto },
+          jp: { port: normalized.jp },
+          sg: { port: normalized.sg },
+          us: { port: normalized.us },
+          hk: { port: normalized.hk },
+          direct: { port: normalized.direct },
+        },
+        routes,
+        updatedAt: props.runtimeConfig?.networkClients.updatedAt || 0,
+      });
+      setSaveMessage("网络端口配置已保存到后端。");
+    } catch (error) {
+      setSaveMessage(error instanceof Error ? error.message : "保存失败");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleSaveTushare = async () => {
+    setTushareSaving(true);
+    setTushareMessage("");
+    try {
+      const result = await authorizedFetch<{ tushare: NonNullable<RuntimeConfig["dataProviders"]>["tushare"]; checkedAt: number }>(
+        `${PLATFORM_API_BASE}/runtime/data-providers/tushare`,
+        "",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            enabled: tushareEnabled,
+            token: tushareToken,
+            baseUrl: tushareBaseUrl,
+          }),
+        }
+      );
+      setTushareEnabled(Boolean(result.tushare?.enabled));
+      setTushareBaseUrl(result.tushare?.baseUrl || "http://api.tushare.pro");
+      setTushareToken("");
+      setTushareMessage(result.tushare?.configured ? `已保存 Tushare 配置，当前 Token：${result.tushare.tokenMasked}` : "已清空 Tushare 配置。");
+      setTushareValidationStatus(result.tushare?.status ? { ok: Boolean(result.tushare.status.ok), checkedAt: Number(result.tushare.status.checkedAt || 0) } : null);
+      await props.reload();
+    } catch (error) {
+      setTushareMessage(error instanceof Error ? error.message : "保存 Tushare 配置失败");
+    } finally {
+      setTushareSaving(false);
+    }
+  };
+
+  const handleValidateTushare = async () => {
+    setTushareValidating(true);
+    setTushareMessage("");
+    try {
+      const result = await authorizedFetch<{ result: { ok: boolean; message: string; checkedAt: number }; tushare?: NonNullable<RuntimeConfig["dataProviders"]>["tushare"] }>(
+        `${PLATFORM_API_BASE}/runtime/data-providers/tushare/validate`,
+        "",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            enabled: tushareEnabled,
+            token: tushareToken,
+            baseUrl: tushareBaseUrl,
+          }),
+        }
+      );
+      setTushareMessage(result.result.message);
+      setTushareValidationStatus({
+        ok: Boolean(result.result.ok),
+        checkedAt: Number(result.result.checkedAt || 0),
+      });
+    } catch (error) {
+      setTushareMessage(error instanceof Error ? error.message : "验证 Tushare 失败");
+      setTushareValidationStatus({ ok: false, checkedAt: Date.now() });
+    } finally {
+      setTushareValidating(false);
+    }
+  };
+
+  const handleSaveLlm = async () => {
+    setLlmSaving(true);
+    setLlmMessage("");
+    try {
+      const result = await authorizedFetch<{ llm: NonNullable<RuntimeConfig["dataProviders"]>["llm"]; checkedAt: number }>(
+        `${PLATFORM_API_BASE}/runtime/data-providers/llm`,
+        "",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            enabled: llmEnabled,
+            provider: llmProvider,
+            apiKey: llmApiKey,
+            baseUrl: llmBaseUrl,
+            model: llmModel,
+          }),
+        }
+      );
+      setLlmEnabled(Boolean(result.llm?.enabled));
+      setLlmProvider(result.llm?.provider || "openai");
+      setLlmBaseUrl(result.llm?.baseUrl || "https://api.openai.com/v1");
+      setLlmModel(result.llm?.model || "gpt-5.4-mini");
+      setLlmApiKey("");
+      setLlmMessage(result.llm?.configured ? `已保存 LLM 配置，当前 Key：${result.llm.apiKeyMasked}` : "未配置 LLM API，将使用系统规则过滤。");
+      setLlmValidationStatus(result.llm?.status ? { ok: Boolean(result.llm.status.ok), checkedAt: Number(result.llm.status.checkedAt || 0) } : null);
+      await props.reload();
+    } catch (error) {
+      setLlmMessage(error instanceof Error ? error.message : "保存 LLM 配置失败");
+    } finally {
+      setLlmSaving(false);
+    }
+  };
+
+  const handleValidateLlm = async () => {
+    setLlmValidating(true);
+    setLlmMessage("");
+    try {
+      const result = await authorizedFetch<{ result: { ok: boolean; message: string; checkedAt: number }; llm?: NonNullable<RuntimeConfig["dataProviders"]>["llm"] }>(
+        `${PLATFORM_API_BASE}/runtime/data-providers/llm/validate`,
+        "",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            enabled: llmEnabled,
+            provider: llmProvider,
+            apiKey: llmApiKey,
+            baseUrl: llmBaseUrl,
+            model: llmModel,
+          }),
+        }
+      );
+      setLlmMessage(result.result.message);
+      setLlmValidationStatus({ ok: Boolean(result.result.ok), checkedAt: Number(result.result.checkedAt || 0) });
+    } catch (error) {
+      setLlmMessage(error instanceof Error ? error.message : "验证 LLM 配置失败");
+      setLlmValidationStatus({ ok: false, checkedAt: Date.now() });
+    } finally {
+      setLlmValidating(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight text-zinc-50">设置</h1>
+      <div>
+        <h1 className="text-2xl font-bold tracking-tight text-zinc-50">设置</h1>
         <p className="mt-1 text-sm text-zinc-500">这里展示当前平台运行配置和代理状态，方便排查环境问题。</p>
       </div>
 
@@ -556,12 +806,254 @@ function SettingsView(props: Snapshot) {
         </Card>
       </div>
 
+      <Card className="border-zinc-800 bg-zinc-950/85">
+        <div className="space-y-5 p-6">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h2 className="text-lg font-semibold text-zinc-100">网络端口配置</h2>
+              <p className="mt-1 text-sm text-zinc-500">
+                为开源后的本地部署保留统一入口。这里配置各地区代理端口，以及默认给各交易目标使用哪条线路。
+              </p>
+            </div>
+            <Button onClick={() => void handleSave()} disabled={saving || !props.runtimeConfig}>
+              {saving ? "保存中..." : "保存配置"}
+            </Button>
+          </div>
+
+          <div className="grid grid-cols-1 gap-6 xl:grid-cols-[1.2fr_0.8fr]">
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+              <div className="mb-3 text-sm font-medium text-zinc-100">代理端口</div>
+              <div className="space-y-3">
+                {clientRows.map((item) => (
+                  <div key={item.clientId} className="grid grid-cols-[140px_1fr] items-center gap-3">
+                    <label className="text-sm text-zinc-300">{item.label}</label>
+                    <input
+                      value={ports[item.clientId]}
+                      onChange={(event) => setPorts((current) => ({ ...current, [item.clientId]: event.target.value.replace(/[^\d]/g, "") }))}
+                      className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white outline-none focus:border-zinc-600"
+                      inputMode="numeric"
+                      placeholder={String(item.defaultPort)}
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+              <div className="mb-3 text-sm font-medium text-zinc-100">线路选择</div>
+              <div className="space-y-3">
+                {routeRows.map((item) => (
+                  <div key={item.routeId} className="grid grid-cols-[120px_1fr] items-center gap-3">
+                    <label className="text-sm text-zinc-300">{item.label}</label>
+                    <select
+                      value={routes[item.routeId] || "auto"}
+                      onChange={(event) => setRoutes((current) => ({ ...current, [item.routeId]: event.target.value as NetworkClientId }))}
+                      className="rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white outline-none focus:border-zinc-600"
+                    >
+                      {clientRows.map((client) => (
+                        <option key={client.clientId} value={client.clientId}>
+                          {client.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-dashed border-zinc-800 bg-zinc-900/20 px-4 py-3 text-sm text-zinc-400">
+            {saveMessage || "保存后，Python 服务与 Node 侧网络客户端会读取同一份配置。已有请求不会强制中断，新请求会按新端口生效。"}
+          </div>
+
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/30 p-4">
+              <div className="mb-3 text-sm font-medium text-zinc-100">已注册网络实现</div>
+              <div className="space-y-2 text-sm text-zinc-400">
+                {(props.runtimeConfig?.networkAdapters || []).map((item) => (
+                  <div key={item.adapterId} className="rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2">
+                    <div className="text-zinc-200">{item.label}</div>
+                    <div className="mt-1 text-xs text-zinc-500">{item.kind} · {item.description}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/30 p-4">
+              <div className="mb-3 text-sm font-medium text-zinc-100">已注册延迟探测</div>
+              <div className="space-y-2 text-sm text-zinc-400">
+                {(props.runtimeConfig?.brokerLatencyProviders || []).map((item) => (
+                  <div key={item.providerId} className="rounded-lg border border-zinc-800 bg-zinc-950/60 px-3 py-2">
+                    <div className="text-zinc-200">{item.label}</div>
+                    <div className="mt-1 text-xs text-zinc-500">{item.supportedTargets.join(", ")}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      </Card>
+
+      <Card className="border-zinc-800 bg-zinc-950/85">
+        <div className="space-y-5 p-6">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h2 className="text-lg font-semibold text-zinc-100">A股 数据源配置</h2>
+              <p className="mt-1 text-sm text-zinc-500">
+                这里接入 Tushare Pro。官方文档显示，2000 积分会员可用大多数基础接口，每分钟约 200 次调用；新闻和公告类接口需要单独权限。
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={() => void handleValidateTushare()} disabled={tushareValidating}>
+                {tushareValidating ? "验证中..." : "验证 Tushare"}
+              </Button>
+              <Button onClick={() => void handleSaveTushare()} disabled={tushareSaving}>
+                {tushareSaving ? "保存中..." : "保存 Tushare"}
+              </Button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 gap-6 xl:grid-cols-[0.9fr_1.1fr]">
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+              <div className="mb-3 text-sm font-medium text-zinc-100">连接设置</div>
+              <div className="space-y-4">
+                <label className="flex items-center justify-between rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-sm text-zinc-300">
+                  <span>启用 Tushare</span>
+                  <input type="checkbox" checked={tushareEnabled} onChange={(event) => setTushareEnabled(event.target.checked)} />
+                </label>
+                <div className="space-y-2">
+                  <label className="text-sm text-zinc-300">Base URL</label>
+                  <input
+                    value={tushareBaseUrl}
+                    onChange={(event) => setTushareBaseUrl(event.target.value)}
+                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white outline-none focus:border-zinc-600"
+                    placeholder="http://api.tushare.pro"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm text-zinc-300">Token</label>
+                  <input
+                    value={tushareToken}
+                    onChange={(event) => setTushareToken(event.target.value)}
+                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white outline-none focus:border-zinc-600"
+                    placeholder={props.runtimeConfig?.dataProviders?.tushare?.tokenMasked || "填写你的 Tushare Token"}
+                  />
+                  <div className="text-xs text-zinc-500">留空会保留当前已保存 Token，便于后续只改启用状态或 URL。</div>
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+              <div className="mb-3 text-sm font-medium text-zinc-100">当前状态</div>
+              <div className="space-y-3 text-sm text-zinc-400">
+                <div>已启用：{props.runtimeConfig?.dataProviders?.tushare?.enabled ? "是" : "否"}</div>
+                <div>已配置 Token：{props.runtimeConfig?.dataProviders?.tushare?.configured ? "是" : "否"}</div>
+                <div className="break-all">当前 URL：{props.runtimeConfig?.dataProviders?.tushare?.baseUrl || tushareBaseUrl}</div>
+                <div>Token 摘要：{props.runtimeConfig?.dataProviders?.tushare?.tokenMasked || "--"}</div>
+                <div>最近验证：{tushareValidationStatus?.checkedAt ? formatDateTime(tushareValidationStatus.checkedAt) : props.runtimeConfig?.dataProviders?.tushare?.status?.checkedAt ? formatDateTime(props.runtimeConfig.dataProviders.tushare.status.checkedAt) : "--"}</div>
+                <div className={tushareValidationStatus?.ok ?? props.runtimeConfig?.dataProviders?.tushare?.status?.ok ? "text-emerald-400" : "text-amber-400"}>
+                  {tushareMessage || props.runtimeConfig?.dataProviders?.tushare?.status?.message || "尚未验证"}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-dashed border-zinc-800 bg-zinc-900/20 px-4 py-3 text-sm text-zinc-400">
+            {tushareMessage || "保存后会写入本地配置文件，验证按钮会用 trade_cal 接口做一次真实测试。"}
+          </div>
+        </div>
+      </Card>
+
+      <Card className="border-zinc-800 bg-zinc-950/85">
+        <div className="space-y-5 p-6">
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <h2 className="text-lg font-semibold text-zinc-100">大模型分析配置</h2>
+              <p className="mt-1 text-sm text-zinc-500">
+                这里控制新闻聚合后的大模型分析。没有配置 API 时，系统会自动退回规则过滤，不会启用大模型。
+              </p>
+            </div>
+            <div className="flex gap-2">
+              <Button variant="outline" onClick={() => void handleValidateLlm()} disabled={llmValidating}>
+                {llmValidating ? "验证中..." : "验证 LLM"}
+              </Button>
+              <Button onClick={() => void handleSaveLlm()} disabled={llmSaving}>
+                {llmSaving ? "保存中..." : "保存 LLM"}
+              </Button>
+            </div>
+          </div>
+
+          <div className="grid grid-cols-1 gap-6 xl:grid-cols-[0.9fr_1.1fr]">
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+              <div className="mb-3 text-sm font-medium text-zinc-100">连接设置</div>
+              <div className="space-y-4">
+                <label className="flex items-center justify-between rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-sm text-zinc-300">
+                  <span>启用大模型分析</span>
+                  <input type="checkbox" checked={llmEnabled} onChange={(event) => setLlmEnabled(event.target.checked)} />
+                </label>
+                <div className="space-y-2">
+                  <label className="text-sm text-zinc-300">供应商</label>
+                  <select
+                    value={llmProvider}
+                    onChange={(event) => handleChangeLlmProvider(event.target.value)}
+                    className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white outline-none focus:border-zinc-600"
+                  >
+                    {llmProviderOptions.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-2">
+                  <label className="text-sm text-zinc-300">接口地址</label>
+                    <input value={llmBaseUrl} onChange={(event) => setLlmBaseUrl(event.target.value)} className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white outline-none focus:border-zinc-600" placeholder="按供应商自动带出，也可手动改" />
+                  </div>
+                  <div className="space-y-2">
+                    <label className="text-sm text-zinc-300">模型</label>
+                    <input value={llmModel} onChange={(event) => setLlmModel(event.target.value)} className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white outline-none focus:border-zinc-600" placeholder="按供应商自动带出，也可手动改" />
+                  </div>
+                <div className="space-y-2">
+                  <label className="text-sm text-zinc-300">API Key</label>
+                  <input value={llmApiKey} onChange={(event) => setLlmApiKey(event.target.value)} className="w-full rounded-lg border border-zinc-800 bg-zinc-950 px-3 py-2 text-sm text-white outline-none focus:border-zinc-600" placeholder={props.runtimeConfig?.dataProviders?.llm?.apiKeyMasked || "填写你的 LLM API Key"} />
+                  <div className="text-xs text-zinc-500">留空会保留当前已保存 Key。未配置 Key 时，系统会只使用规则过滤和聚类。</div>
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-xl border border-zinc-800 bg-zinc-900/40 p-4">
+              <div className="mb-3 text-sm font-medium text-zinc-100">当前状态</div>
+              <div className="space-y-3 text-sm text-zinc-400">
+                <div>当前模式：{props.runtimeConfig?.dataProviders?.llm?.mode === "llm" ? "大模型分析" : "系统过滤"}</div>
+                <div>已启用：{props.runtimeConfig?.dataProviders?.llm?.enabled ? "是" : "否"}</div>
+                <div>已配置 API：{props.runtimeConfig?.dataProviders?.llm?.configured ? "是" : "否"}</div>
+                <div>供应商：{(props.runtimeConfig?.dataProviders?.llm?.provider || llmProvider) === "zhipu" ? "智谱 AI" : "OpenAI"}</div>
+                <div>模型：{props.runtimeConfig?.dataProviders?.llm?.model || llmModel}</div>
+                <div className="break-all">当前 URL：{props.runtimeConfig?.dataProviders?.llm?.baseUrl || llmBaseUrl}</div>
+                <div>Key 摘要：{props.runtimeConfig?.dataProviders?.llm?.apiKeyMasked || "--"}</div>
+                <div>最近验证：{llmValidationStatus?.checkedAt ? formatDateTime(llmValidationStatus.checkedAt) : props.runtimeConfig?.dataProviders?.llm?.status?.checkedAt ? formatDateTime(props.runtimeConfig.dataProviders.llm.status.checkedAt) : "--"}</div>
+                <div className={llmValidationStatus?.ok ?? props.runtimeConfig?.dataProviders?.llm?.status?.ok ? "text-emerald-400" : "text-amber-400"}>
+                  {llmMessage || props.runtimeConfig?.dataProviders?.llm?.status?.message || "未配置 LLM API，将使用系统规则过滤。"}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-dashed border-zinc-800 bg-zinc-900/20 px-4 py-3 text-sm text-zinc-400">
+            {llmMessage || "未配置 LLM API 时，新闻聚合仍会继续工作，但只使用系统过滤、规则聚类和事件分组。"}
+          </div>
+        </div>
+      </Card>
+
     </div>
   );
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState(() => localStorage.getItem("quantx.activeTab") || "dashboard");
+  const [activeTab, setActiveTab] = useState(() => {
+    const next = localStorage.getItem("quantx.activeTab") || "dashboard";
+    return ["dashboard", "intelligence", "market", "dataCenter", "backtesting", "strategies", "settings"].includes(next) ? next : "dashboard";
+  });
   const snapshot = usePlatformSnapshot();
 
   useEffect(() => {
@@ -570,12 +1062,11 @@ export default function App() {
 
   let content: React.ReactNode = null;
   if (activeTab === "dashboard") content = <RuntimeErrorBoundary area="平台总览"><DashboardView {...snapshot} /></RuntimeErrorBoundary>;
-  else if (activeTab === "research") content = <RuntimeErrorBoundary area="研究工作区"><ResearchWorkspace /></RuntimeErrorBoundary>;
+  else if (activeTab === "intelligence") content = <RuntimeErrorBoundary area="市场情报中心"><MarketIntelligenceWorkspace /></RuntimeErrorBoundary>;
+  else if (activeTab === "market") content = <RuntimeErrorBoundary area="行情中心"><MarketWorkspace /></RuntimeErrorBoundary>;
   else if (activeTab === "dataCenter") content = <RuntimeErrorBoundary area="数据中心"><DataCenterView {...snapshot} /></RuntimeErrorBoundary>;
   else if (activeTab === "backtesting") content = <RuntimeErrorBoundary area="回测中心"><BacktestingView {...snapshot} onOpenStrategies={() => setActiveTab("strategies")} /></RuntimeErrorBoundary>;
   else if (activeTab === "strategies") content = <RuntimeErrorBoundary area="策略工作流"><StrategyWorkbench /></RuntimeErrorBoundary>;
-  else if (activeTab === "portfolio") content = <RuntimeErrorBoundary area="组合工作区"><PortfolioWorkspace /></RuntimeErrorBoundary>;
-  else if (activeTab === "governance") content = <RuntimeErrorBoundary area="治理工作区"><GovernanceWorkspace /></RuntimeErrorBoundary>;
   else if (activeTab === "settings") content = <RuntimeErrorBoundary area="设置"><SettingsView {...snapshot} /></RuntimeErrorBoundary>;
 
   return (

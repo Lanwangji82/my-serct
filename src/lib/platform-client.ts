@@ -1,8 +1,4 @@
 ﻿export const PLATFORM_API_BASE = "/api/platform";
-export const RESEARCH_API_BASE = "/research";
-export const PORTFOLIO_API_BASE = "/portfolio";
-export const GOVERNANCE_API_BASE = "/governance";
-
 const inflightGetRequests = new Map<string, Promise<unknown>>();
 const cachedGetResponses = new Map<string, { expiresAt: number; value: unknown }>();
 
@@ -20,6 +16,159 @@ export type BrokerRegistrySummary = {
   }>;
 };
 
+export type NetworkClientId = "auto" | "jp" | "sg" | "us" | "hk" | "direct";
+
+export type NetworkClientCatalogEntry = {
+  clientId: NetworkClientId;
+  label: string;
+  defaultPort: number;
+  kind: string;
+};
+
+export type NetworkRouteCatalogEntry = {
+  routeId: string;
+  label: string;
+  kind: string;
+};
+
+export type MarketIntelligenceMarketKey = "a_share" | "crypto";
+
+export type MarketIntelligenceMarketSummary = {
+  key: MarketIntelligenceMarketKey;
+  label: string;
+  indexName: string;
+  indexValue: number;
+  changePct: number;
+  sentiment: "bullish" | "neutral" | "bearish";
+  newsCount: number;
+  eventCount: number;
+  watchCount: number;
+  signal: string;
+  summary: string;
+};
+
+export type MarketIntelligenceTheme = {
+  id: string;
+  market: MarketIntelligenceMarketKey;
+  title: string;
+  summary: string;
+  mentions: number;
+  impactScore: number;
+  sentiment: "bullish" | "neutral" | "bearish";
+  keywords: string[];
+  updatedAt: number;
+};
+
+export type MarketIntelligenceNewsItem = {
+  id: string;
+  market: MarketIntelligenceMarketKey;
+  title: string;
+  summary: string;
+  source: string;
+  publishedAt: number;
+  url?: string;
+  impact: "high" | "medium" | "low";
+  tags: string[];
+};
+
+export type MarketIntelligenceWatchItem = {
+  id: string;
+  market: MarketIntelligenceMarketKey;
+  symbol: string;
+  label: string;
+  price: number;
+  changePct: number;
+  reason: string;
+  confidence: number;
+  updatedAt: number;
+};
+
+export type MarketIntelligenceOverview = {
+  checkedAt: number;
+  sourceMode: "live" | "seed";
+  freshnessLabel?: string;
+  highlights: string[];
+  markets: MarketIntelligenceMarketSummary[];
+  themes: MarketIntelligenceTheme[];
+  news: MarketIntelligenceNewsItem[];
+  watchlist: MarketIntelligenceWatchItem[];
+};
+
+export type RuntimeProxySummary = {
+  configured: boolean;
+  mode?: string;
+  source?: string;
+  activeProxy?: string;
+  httpProxy?: string;
+  httpsProxy?: string;
+  socksProxy?: string;
+};
+
+export type RuntimeConfig = {
+  appPort: number;
+  localMode: boolean;
+  databasePath: string;
+  strategyStoreRoot: string;
+  networkClients: {
+    clients: Record<NetworkClientId, { port: number }>;
+    routes: Record<string, NetworkClientId>;
+    clientCatalog?: NetworkClientCatalogEntry[];
+    routeCatalog?: NetworkRouteCatalogEntry[];
+    updatedAt: number;
+  };
+  networkClientCatalog?: NetworkClientCatalogEntry[];
+  networkRouteCatalog?: NetworkRouteCatalogEntry[];
+  networkAdapters?: Array<{
+    adapterId: string;
+    label: string;
+    kind: string;
+    configurable: boolean;
+    description: string;
+  }>;
+  brokerLatencyProviders?: Array<{
+    providerId: string;
+    label: string;
+    supportedTargets: string[];
+  }>;
+  brokerTargets?: Array<{
+    target: string;
+    brokerId: string;
+    mode: string;
+    label: string;
+    supportsMarketData: boolean;
+    supportsExecution: boolean;
+  }>;
+  dataProviders?: {
+    tushare?: {
+      enabled: boolean;
+      configured: boolean;
+      baseUrl: string;
+      tokenMasked: string;
+      status?: {
+        ok: boolean;
+        message: string;
+        checkedAt: number;
+      };
+    };
+    llm?: {
+      enabled: boolean;
+      configured: boolean;
+      provider: string;
+      baseUrl: string;
+      model: string;
+      apiKeyMasked: string;
+      mode: "system" | "llm";
+      status?: {
+        ok: boolean;
+        message: string;
+        checkedAt: number;
+      };
+    };
+  };
+  proxy: RuntimeProxySummary;
+  checkedAt: number;
+};
+
 export function formatDateTime(value: number) {
   return new Date(value).toLocaleString("zh-CN");
 }
@@ -35,6 +184,7 @@ export function formatMoney(value: number | null | undefined, digits = 2) {
 
 function getCacheTtl(path: string) {
   if (path.includes("/runtime/connectivity")) return 5_000;
+  if (path.includes("/intelligence/overview")) return 10_000;
   if (path.includes("/backtests/")) return 1_000;
   if (path.includes("/strategies") || path.includes("/me")) return 2_000;
   return 0;

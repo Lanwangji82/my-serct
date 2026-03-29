@@ -1,0 +1,28 @@
+{
+  "clients": {
+    "auto": {
+      "port": 7890
+    },
+    "jp": {
+      "port": 7891
+    },
+    "sg": {
+      "port": 7892
+    },
+    "us": {
+      "port": 7893
+    },
+    "hk": {
+      "port": 7894
+    },
+    "direct": {
+      "port": 7895
+    }
+  },
+  "routes": {
+    "default": "auto",
+    "binance": "jp",
+    "okx": "auto"
+  },
+  "updatedAt": 1774701140953
+}

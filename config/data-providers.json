@@ -1,0 +1,26 @@
+{
+  "tushare": {
+    "enabled": false,
+    "token": "",
+    "baseUrl": "http://api.tushare.pro",
+    "status": {
+      "ok": false,
+      "message": "未配置 Tushare Token。",
+      "checkedAt": 0,
+      "enabled": false
+    }
+  },
+  "llm": {
+    "enabled": false,
+    "provider": "zhipu",
+    "apiKey": "",
+    "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
+    "model": "glm-4.5",
+    "status": {
+      "ok": false,
+      "message": "未配置 LLM API，将使用系统规则过滤。",
+      "checkedAt": 0,
+      "enabled": false
+    }
+  }
+}

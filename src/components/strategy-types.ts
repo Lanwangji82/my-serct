@@ -146,6 +146,22 @@ export type BacktestRun = {
     startedAtText?: string;
     endedAtText?: string;
     durationMs?: number;
+    period?: string;
+    basePeriod?: string;
+    mode?: string;
+    quoteAsset?: string;
+    tolerancePct?: number;
+    candleLimit?: number;
+    chartDisplay?: string;
+    depthMin?: number;
+    depthMax?: number;
+    recordEvents?: boolean;
+    leverage?: number;
+    chartBars?: number;
+    delayMs?: number;
+    logLimit?: number;
+    profitLimit?: number;
+    orderMode?: string;
   };
   statusInfo?: {
     backtestStatus?: number;

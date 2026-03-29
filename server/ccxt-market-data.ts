@@ -6,38 +6,38 @@ type BinanceMarketType = 'spot' | 'futures';
 export type MarketExchange = 'binance' | 'okx';
 
 const QUOTES = ['USDT', 'USDC', 'BUSD', 'FDUSD', 'USD'];
-
-const spotExchange = new ccxt.binance({
-  enableRateLimit: true,
-  ...getCcxtProxyOptions(),
-});
-
-const futuresExchange = new ccxt.binanceusdm({
-  enableRateLimit: true,
-  ...getCcxtProxyOptions(),
-});
-
-const okxSpotExchange = new ccxt.okx({
-  enableRateLimit: true,
-  ...getCcxtProxyOptions(),
-  options: {
-    defaultType: 'spot',
-  },
-});
-
-const okxFuturesExchange = new ccxt.okx({
-  enableRateLimit: true,
-  ...getCcxtProxyOptions(),
-  options: {
-    defaultType: 'swap',
-  },
-});
+const exchangeCache = new Map<string, any>();
 
 function getExchange(type: BinanceMarketType, exchange: MarketExchange) {
-  if (exchange === 'okx') {
-    return type === 'spot' ? okxSpotExchange : okxFuturesExchange;
+  const cacheKey = `${exchange}:${type}`;
+  const cached = exchangeCache.get(cacheKey);
+  if (cached) {
+    return cached;
   }
-  return type === 'spot' ? spotExchange : futuresExchange;
+
+  let instance: any;
+  if (exchange === 'okx') {
+    instance = new ccxt.okx({
+      enableRateLimit: true,
+      ...getCcxtProxyOptions({ brokerId: 'okx' }),
+      options: {
+        defaultType: type === 'spot' ? 'spot' : 'swap',
+      },
+    });
+  } else if (type === 'spot') {
+    instance = new ccxt.binance({
+      enableRateLimit: true,
+      ...getCcxtProxyOptions({ brokerId: 'binance' }),
+    });
+  } else {
+    instance = new ccxt.binanceusdm({
+      enableRateLimit: true,
+      ...getCcxtProxyOptions({ brokerId: 'binance' }),
+    });
+  }
+
+  exchangeCache.set(cacheKey, instance);
+  return instance;
 }
 
 function toUnifiedSymbol(symbol: string) {

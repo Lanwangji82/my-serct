@@ -9,9 +9,13 @@ coverage/
 .env.local
 docs/api.txt
 python_services/__pycache__/
+python_services/app/**/__pycache__/
+*.pyc
 external/backtest_python/__pycache__/
 python_services/data/
 python_services/strategy_store/
 server/data/
 .env*
 !.env.example
+cache.db
+python_services/config/

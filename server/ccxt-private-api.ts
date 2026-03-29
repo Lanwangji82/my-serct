@@ -78,7 +78,7 @@ function createSpotExchange(credentials: { apiKey: string; apiSecret: string }) 
     apiKey: credentials.apiKey,
     secret: credentials.apiSecret,
     enableRateLimit: true,
-    ...getCcxtProxyOptions(),
+    ...getCcxtProxyOptions({ brokerId: 'binance' }),
   });
 }
 
@@ -87,7 +87,7 @@ function createFuturesExchange(credentials: { apiKey: string; apiSecret: string 
     apiKey: credentials.apiKey,
     secret: credentials.apiSecret,
     enableRateLimit: true,
-    ...getCcxtProxyOptions(),
+    ...getCcxtProxyOptions({ brokerId: 'binance' }),
   });
 }
 
@@ -97,7 +97,7 @@ function createOkxExchange(type: BinanceMarketType, credentials: { apiKey: strin
     secret: credentials.apiSecret,
     password: credentials.password || process.env.OKX_API_PASSPHRASE || '',
     enableRateLimit: true,
-    ...getCcxtProxyOptions(),
+    ...getCcxtProxyOptions({ brokerId: 'okx' }),
     options: {
       defaultType: type === 'spot' ? 'spot' : 'swap',
     },

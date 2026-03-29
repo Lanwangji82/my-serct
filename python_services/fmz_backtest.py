@@ -542,7 +542,12 @@ def lookup_snapshot_state(snapshot_times: list[int], snapshot_states: list[dict[
     return snapshot_states[index]
 
 
-def build_market_rows(raw_result: dict[str, Any], initial_capital: float, ohlcv_rows: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+def build_market_rows(
+    raw_result: dict[str, Any],
+    initial_capital: float,
+    config: BacktestConfig,
+    ohlcv_rows: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     snapshot_times, snapshot_states = build_snapshot_timeline(raw_result, initial_capital)
     if ohlcv_rows:
         rows: list[dict[str, Any]] = []
@@ -570,7 +575,7 @@ def build_market_rows(raw_result: dict[str, Any], initial_capital: float, ohlcv_
             )
         return rows
 
-    rows: list[dict[str, Any]] = []
+    snapshot_rows: list[dict[str, Any]] = []
     for item in raw_result.get("Snapshots") or []:
         if not isinstance(item, list) or len(item) < 2 or not item[1]:
             continue
@@ -581,7 +586,7 @@ def build_market_rows(raw_result: dict[str, Any], initial_capital: float, ohlcv_
         long_data = symbol_data.get("Long") or {}
         short_data = symbol_data.get("Short") or {}
         pnl = float(account.get("PnL") or 0)
-        rows.append(
+        snapshot_rows.append(
             {
                 "time": timestamp,
                 "lastPrice": round(float(symbol_data.get("Last") or 0), 6),
@@ -595,7 +600,58 @@ def build_market_rows(raw_result: dict[str, Any], initial_capital: float, ohlcv_
                 "shortProfit": round(float(short_data.get("Profit") or 0), 6),
             }
         )
-    return rows
+    if not snapshot_rows:
+        return []
+
+    bucket_ms = parse_period_to_ms(config.period)
+    grouped: list[dict[str, Any]] = []
+    previous_close = 0.0
+    previous_long_amount = 0.0
+    previous_short_amount = 0.0
+
+    for row in snapshot_rows:
+        bucket_time = int(row["time"] // bucket_ms * bucket_ms)
+        price = float(row["lastPrice"])
+        long_amount = float(row.get("longAmount") or 0)
+        short_amount = float(row.get("shortAmount") or 0)
+        current = grouped[-1] if grouped and int(grouped[-1]["time"]) == bucket_time else None
+
+        if current is None:
+            open_price = previous_close if previous_close > 0 else price
+            grouped.append(
+                {
+                    **row,
+                    "time": bucket_time,
+                    "open": round(open_price, 6),
+                    "high": round(max(open_price, price), 6),
+                    "low": round(min(open_price, price), 6),
+                    "close": round(price, 6),
+                    "volume": round(abs(long_amount - previous_long_amount) + abs(short_amount - previous_short_amount), 6),
+                }
+            )
+        else:
+            current["high"] = round(max(float(current.get("high") or price), price), 6)
+            current["low"] = round(min(float(current.get("low") or price), price), 6)
+            current["close"] = round(price, 6)
+            current["lastPrice"] = round(price, 6)
+            current["equity"] = row["equity"]
+            current["utilization"] = row["utilization"]
+            current["longAmount"] = row["longAmount"]
+            current["longPrice"] = row["longPrice"]
+            current["longProfit"] = row["longProfit"]
+            current["shortAmount"] = row["shortAmount"]
+            current["shortPrice"] = row["shortPrice"]
+            current["shortProfit"] = row["shortProfit"]
+            current["volume"] = round(
+                float(current.get("volume") or 0) + abs(long_amount - previous_long_amount) + abs(short_amount - previous_short_amount),
+                6,
+            )
+
+        previous_close = price
+        previous_long_amount = long_amount
+        previous_short_amount = short_amount
+
+    return grouped
 
 
 def build_trade_rows(raw_result: dict[str, Any], config: BacktestConfig) -> list[dict[str, Any]]:
@@ -780,7 +836,7 @@ def _run_fmz_backtest_direct(source_code: str, config: BacktestConfig) -> dict[s
     if config.record_events:
         runtime_logs = sorted([*runtime_logs, *build_funding_logs(result, config)], key=lambda item: int(item["time"]))
     trade_rows = build_trade_rows(result, config)
-    market_rows = build_market_rows(result, config.initial_capital, ohlcv_rows)
+    market_rows = build_market_rows(result, config.initial_capital, config, ohlcv_rows)
     status_info = build_status_info(result, asset_rows, market_rows, trade_rows, config)
 
     if asset_rows:

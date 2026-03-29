@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite --port=3000 --host=0.0.0.0",
     "dev:all": "tsx server/dev-runner.ts",
+    "dev:all:bg": "powershell -NoProfile -ExecutionPolicy Bypass -File ./start-dev-all.ps1",
+    "dev:all:stop": "powershell -NoProfile -ExecutionPolicy Bypass -File ./stop-dev-all.ps1",
     "service:py-platform": "python python_services/run_server.py",
     "proxy": "tsx server/binance-proxy.ts",
     "service:market-ingest": "tsx server/market-ingest-service.ts",

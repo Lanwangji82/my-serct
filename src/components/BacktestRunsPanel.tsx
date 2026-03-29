@@ -111,6 +111,21 @@ function periodMs(value: number, unit: "m" | "h" | "d") {
   return n * 60 * 60 * 1000;
 }
 
+function parsePeriod(value: unknown): { value: number; unit: "m" | "h" | "d" } {
+  const match = String(value || "").trim().match(/^(\d+)([mhd])$/i);
+  if (!match) {
+    return { value: 1, unit: "h" };
+  }
+  return {
+    value: Math.max(Number(match[1]) || 1, 1),
+    unit: match[2].toLowerCase() as "m" | "h" | "d",
+  };
+}
+
+function getEventVolume(events: MarketEvent[] | undefined) {
+  return (events || []).reduce((sum, event) => sum + Math.abs(Number(event.quantity || 0)), 0);
+}
+
 function buildCandles(rows: MarketRow[], value: number, unit: "m" | "h" | "d"): Candle[] {
   if (rows.some((row) => typeof row.open === "number" && typeof row.high === "number" && typeof row.low === "number" && typeof row.close === "number")) {
     return [...rows]
@@ -128,29 +143,45 @@ function buildCandles(rows: MarketRow[], value: number, unit: "m" | "h" | "d"): 
 
   const bucket = periodMs(value, unit);
   const map = new Map<number, Candle>();
-  for (const row of rows) {
+  let previousClose = 0;
+  let previousLongAmount = 0;
+  let previousShortAmount = 0;
+  for (const row of [...rows].sort((a, b) => a.time - b.time)) {
     const bucketTime = Math.floor(row.time / bucket) * bucket;
-    const price = Number(row.lastPrice || 0);
+    const price = Number(row.lastPrice || row.close || row.open || 0);
     const longAmount = Math.abs(Number(row.longAmount || 0));
     const shortAmount = Math.abs(Number(row.shortAmount || 0));
+    const events = [...(row.events || [])];
+    const eventPrices = events.map((event) => Number(event.price || event.averagePrice || 0)).filter((item) => item > 0);
+    const positionDelta = Math.abs(longAmount - previousLongAmount) + Math.abs(shortAmount - previousShortAmount);
+    const derivedVolume = Math.max(getEventVolume(events), positionDelta);
     const current = map.get(bucketTime);
     if (!current) {
+      const derivedOpen = previousClose > 0 ? previousClose : price;
+      const derivedHigh = Math.max(derivedOpen, price, ...eventPrices);
+      const derivedLow = Math.min(derivedOpen, price, ...(eventPrices.length ? eventPrices : [price]));
       map.set(bucketTime, {
         time: bucketTime,
-        open: price,
-        high: price,
-        low: price,
+        open: derivedOpen,
+        high: derivedHigh,
+        low: derivedLow,
         close: price,
-        volume: longAmount + shortAmount,
-        events: [...(row.events || [])],
+        volume: derivedVolume,
+        events,
       });
+      previousClose = price;
+      previousLongAmount = longAmount;
+      previousShortAmount = shortAmount;
       continue;
     }
-    current.high = Math.max(current.high, price);
-    current.low = Math.min(current.low, price);
+    current.high = Math.max(current.high, price, ...eventPrices);
+    current.low = Math.min(current.low, price, ...(eventPrices.length ? eventPrices : [price]));
     current.close = price;
-    current.volume += longAmount + shortAmount;
-    if (row.events?.length) current.events.push(...row.events);
+    current.volume += derivedVolume;
+    if (events.length) current.events.push(...events);
+    previousClose = price;
+    previousLongAmount = longAmount;
+    previousShortAmount = shortAmount;
   }
   return [...map.values()].sort((a, b) => a.time - b.time);
 }
@@ -178,8 +209,8 @@ function buildOverviewSeries(rows: MarketRow[], candles: Candle[], initialCapita
         periodPnlPct,
         periodPnlUp: periodPnlPct >= 0 ? periodPnlPct : 0,
         periodPnlDown: periodPnlPct < 0 ? periodPnlPct : 0,
-        volumeUp: periodPnlPct >= 0 ? Number(candle.volume ?? 0) : 0,
-        volumeDown: periodPnlPct < 0 ? -Math.abs(Number(candle.volume ?? 0)) : 0,
+        volumeUp: candle.close >= candle.open ? Number(candle.volume ?? 0) : 0,
+        volumeDown: candle.close < candle.open ? -Math.abs(Number(candle.volume ?? 0)) : 0,
         trades: candle.events.length,
         longQty: Math.max(Number(row?.longAmount ?? 0), 0),
         shortQty: Math.max(Number(row?.shortAmount ?? 0), 0),
@@ -479,11 +510,19 @@ export function BacktestRunsPanel(props: {
   const [showAdvanced, setShowAdvanced] = useState(false);
   const latestRun = props.latestRun;
   const active = latestRun?.status === "queued" || latestRun?.status === "running";
+  const effectivePeriod = useMemo(
+    () => parsePeriod(latestRun?.summary?.period ?? latestRun?.params?.period ?? `${props.config.periodValue}${props.config.periodUnit}`),
+    [latestRun?.params, latestRun?.summary?.period, props.config.periodUnit, props.config.periodValue]
+  );
+  const effectiveBasePeriod = useMemo(
+    () => parsePeriod(latestRun?.summary?.basePeriod ?? latestRun?.params?.basePeriod ?? `${props.config.basePeriodValue}${props.config.basePeriodUnit}`),
+    [latestRun?.params, latestRun?.summary?.basePeriod, props.config.basePeriodUnit, props.config.basePeriodValue]
+  );
   const marketRows = useMemo(
     () => latestRun?.marketRows?.length ? latestRun.marketRows : (latestRun?.equityCurve || []).map((p) => ({ time: p.time, lastPrice: 0, equity: p.equity, events: [] })),
     [latestRun]
   );
-  const candles = useMemo(() => buildCandles(marketRows, props.config.periodValue, props.config.periodUnit), [marketRows, props.config.periodValue, props.config.periodUnit]);
+  const candles = useMemo(() => buildCandles(marketRows, effectivePeriod.value, effectivePeriod.unit), [effectivePeriod.unit, effectivePeriod.value, marketRows]);
   const [hoverTime, setHoverTime] = useState<number | null>(null);
   const hovered = useMemo(() => candles.find((item) => item.time === hoverTime) || candles[candles.length - 1] || null, [candles, hoverTime]);
   const trades = useMemo(() => [...(latestRun?.trades || [])].reverse(), [latestRun?.trades]);
@@ -507,7 +546,7 @@ export function BacktestRunsPanel(props: {
         return prev > 0 ? (point.equity - prev) / prev : 0;
       })
       .filter((value) => Number.isFinite(value));
-    const volatilityPct = stddev(returns) * Math.sqrt(periodsPerYear(props.config.periodUnit, props.config.periodValue)) * 100;
+    const volatilityPct = stddev(returns) * Math.sqrt(periodsPerYear(effectivePeriod.unit, effectivePeriod.value)) * 100;
     return {
       initialCapital,
       endingEquity,
@@ -520,7 +559,7 @@ export function BacktestRunsPanel(props: {
       orderCount: Number(latestRun.summary?.orderCount ?? latestRun.metrics.trades ?? 0),
       barCount: Number(latestRun.summary?.barCount ?? candles.length),
     };
-  }, [candles.length, latestRun, props.config.initialCapital, props.config.periodUnit, props.config.periodValue]);
+  }, [candles.length, effectivePeriod.unit, effectivePeriod.value, latestRun, props.config.initialCapital]);
   const overviewData = useMemo(() => {
     if (!latestRun) return [];
     const initialCapital = Number((latestRun.params?.initialCapital as number | undefined) ?? props.config.initialCapital ?? 0);
@@ -629,9 +668,13 @@ export function BacktestRunsPanel(props: {
                   <div className="text-sm font-medium text-zinc-100">行情数据</div>
                   <div className="mt-1 text-xs text-zinc-500">图表区域已放大，右侧状态卡挪到下方。</div>
                 </div>
+                <div className="text-xs text-zinc-500">
+                  本次回测周期 {`${effectivePeriod.value}${effectivePeriod.unit}`}，底层周期 {`${effectiveBasePeriod.value}${effectiveBasePeriod.unit}`}。
+                </div>
                 <div className="flex flex-wrap gap-2">
                   <Badge variant="default">{latestRun.source || "fmz-official-local"}</Badge>
-                  <Badge variant="success">{`${props.config.periodValue}${props.config.periodUnit}`}</Badge>
+                  <Badge variant="success">{`${effectivePeriod.value}${effectivePeriod.unit}`}</Badge>
+                  <Badge variant="outline">{`底层 ${effectiveBasePeriod.value}${effectiveBasePeriod.unit}`}</Badge>
                 </div>
               </div>
               {candles.length ? <ChartPanel candles={candles} hovered={hovered} onHover={setHoverTime} /> : <div className="flex h-[640px] items-center justify-center rounded-xl border border-dashed border-zinc-800 text-sm text-zinc-500">当前还没有行情数据。</div>}
