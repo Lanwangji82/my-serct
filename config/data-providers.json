@@ -1,25 +1,25 @@
 {
   "tushare": {
     "enabled": false,
-    "token": "",
+    "token": "bf8cb8e277bf6a89dd4aa893c854b6cd10a52a3e868b9447bba88bd4",
     "baseUrl": "http://api.tushare.pro",
     "status": {
-      "ok": false,
-      "message": "未配置 Tushare Token。",
-      "checkedAt": 0,
+      "ok": true,
+      "message": "Tushare 已连通，trade_cal 测试成功，返回 5 条记录。",
+      "checkedAt": 1774789011478,
       "enabled": false
     }
   },
   "llm": {
     "enabled": false,
     "provider": "zhipu",
-    "apiKey": "",
+    "apiKey": "ddea7373b56b47c8818fa3f6ee4c736f.SlFWgon0UnlZR8fV",
     "baseUrl": "https://open.bigmodel.cn/api/paas/v4",
     "model": "glm-4.5",
     "status": {
-      "ok": false,
-      "message": "未配置 LLM API，将使用系统规则过滤。",
-      "checkedAt": 0,
+      "ok": true,
+      "message": "已验证 zhipu / glm-4.5，大模型分析可用。",
+      "checkedAt": 1774788991285,
       "enabled": false
     }
   }

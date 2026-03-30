@@ -4,10 +4,10 @@
 
 QuantX is organized around a single platform API and a small set of sidecar services:
 
-- `src/`: React + Vite frontend
-- `python_services/`: FastAPI platform API and core business logic
-- `python_services/app/`: Python platform layering for adapters, repositories, and service modules
-- `server/`: Node/TypeScript sidecars for market data, proxy integration, and local development tooling
+- `frontend/src/`: React + Vite frontend
+- `backend/python/`: FastAPI platform API and core business logic
+- `backend/python/app/`: Python platform layering for adapters, repositories, and service modules
+- `backend/node/`: Node/TypeScript sidecars for market data, proxy integration, and local development tooling
 - `config/`: shared runtime configuration files
 
 ## Runtime Roles
@@ -75,12 +75,12 @@ The project has already moved part of the Python platform into reusable modules:
 - audit persistence now lives behind an audit service
 - broker latency probing now goes through an adapter
 - strategy, backtest, and runtime configuration logic are split out of `main.py`
-- strategy and backtest services now live under `python_services/app/services/`
-- runtime service now lives under `python_services/app/services/` and network runtime configuration is accessed through a dedicated adapter
-- runtime config storage has also moved behind `python_services/app/adapters/`
-- platform routes and request schemas now live under `python_services/app/api/`
-- bootstrap and storage setup now live under `python_services/app/bootstrap/`, leaving `main.py` focused on app assembly
-- service and adapter wiring now also lives under `python_services/app/bootstrap/`, so `main.py` stays close to a pure entrypoint
+- strategy and backtest services now live under `backend/python/app/services/`
+- runtime service now lives under `backend/python/app/services/` and network runtime configuration is accessed through a dedicated adapter
+- runtime config storage has also moved behind `backend/python/app/adapters/`
+- platform routes and request schemas now live under `backend/python/app/api/`
+- bootstrap and storage setup now live under `backend/python/app/bootstrap/`, leaving `main.py` focused on app assembly
+- service and adapter wiring now also lives under `backend/python/app/bootstrap/`, so `main.py` stays close to a pure entrypoint
 - broker latency probing no longer reaches into config storage directly; proxy resolution now comes through the network runtime adapter boundary
 - broker targets and network implementations are now described through a bootstrap registry, which gives the project a clearer plugin-style extension surface
 - adapter creation now also goes through the bootstrap registry, so adding a new network runtime or broker latency provider is primarily a registry change instead of a factory rewrite

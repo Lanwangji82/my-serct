@@ -1,139 +1,76 @@
 # QuantX Platform
 
-QuantX Platform 是一套以 FMZ 为核心回测底座的量化工作台，当前重点能力包括：
+中文量化交易工作台，聚焦本地研究、市场情报、行情查看、策略管理与回测。
 
-- 策略档案库与本地 Python 策略导入
-- FMZ 风格本地回测
-- 回测结果展示、行情数据、收益概览、日志与资产结果
-- 交易所联通检测
+## 目录结构
 
-当前技术栈：
+- `frontend/`
+  React + TypeScript + Vite 前端界面与构建产物
+- `backend/python/`
+  FastAPI 主平台 API、运行时配置、市场情报、行情与回测服务
+- `backend/node/`
+  Node 边车、代理集成、市场侧工具与本地开发编排
+- `docs/`
+  架构说明与文档资源
+- `config/`
+  共享运行时配置
+- `scripts/`
+  本地启动与停止脚本
 
-- 前端：React + TypeScript + Vite
-- 后端：Python + FastAPI
-- 回测：FMZ 官方本地 Python 回测库
-- 数据存储：MongoDB 7
-- 缓存与运行时加速：Redis 协议兼容服务
+## 主要能力
 
-## 本地启动
+- A 股与加密双市场情报
+- A 股与加密 K 线行情中心
+- 策略管理与本地回测
+- 网络端口与代理路由配置
+- Tushare / LLM 数据源配置
+- Redis 热缓存 + Mongo 快照 + 后台刷新任务
 
-### 前置依赖
+## 本地开发
 
-- Node.js 20+
-- Python 3.11+
-- MongoDB 7
-- Redis 7 或 Redis 协议兼容服务
-
-Windows 本地环境推荐：
-
-- MongoDB：MongoDB Community Server 7.x
-- Redis：Memurai Developer
-
-### 安装项目依赖
-
-1. 安装前端依赖
+安装依赖：
 
 ```bash
 npm install
+pip install -r backend/python/requirements.txt
 ```
 
-2. 安装 Python 依赖
-
-```bash
-pip install -r python_services/requirements.txt
-```
-
-### 启动本地依赖
-
-如果你已经把 MongoDB 和 Memurai 安装为 Windows 服务，可以直接启动：
-
-```powershell
-Start-Service MongoDB
-Start-Service Memurai
-```
-
-可用下面的方式验证服务：
-
-```powershell
-sc query MongoDB
-sc query Memurai
-```
-
-### 配置环境变量
-
-在项目根目录创建 `.env.local`：
-
-```env
-PY_PLATFORM_STORAGE_BACKEND=mongo
-MONGODB_URI=mongodb://127.0.0.1:27017
-MONGODB_DB_NAME=quantx_platform
-REDIS_URL=redis://127.0.0.1:6379/0
-```
-
-如果你暂时不想启用 MongoDB，也可以不配置这些变量，后端会回退到本地 JSON 存储模式。
-
-### 启动开发环境
-
-整套开发环境：
+启动整套开发环境：
 
 ```bash
 npm run dev:all
 ```
 
-只启动 Python 平台服务：
+后台启动与停止：
 
 ```bash
-python python_services/run_server.py
+npm run dev:all:bg
+npm run dev:all:stop
 ```
 
-启动后默认地址：
+仅启动 Python 平台：
 
-- 前端开发环境：`http://localhost:3000`
-- Python 平台服务：`http://127.0.0.1:8800`
+```bash
+python backend/python/run_server.py
+```
 
-## 存储目录
+## 前端构建
 
-### 策略档案目录
+```bash
+npm run build
+```
 
-默认保存在：
+前端构建产物输出到：
 
-`python_services/strategy_store/`
+`frontend/build/`
 
-可通过环境变量 `PY_PLATFORM_STRATEGY_STORE` 自定义。
+## 运行依赖
 
-### 回测详情目录
+- Node.js 20+
+- Python 3.11+
+- MongoDB 7
+- Redis 7 或兼容服务
 
-回测摘要保存在主存储中，详细结果默认保存在：
+## 文档
 
-`python_services/data/backtests/`
-
-这样可以避免把整份大回测结果都塞进主状态存储，减少读取和写入压力。
-
-## 当前存储架构
-
-### MongoDB 7
-
-用于保存主业务状态：
-
-- 用户与会话
-- 策略摘要
-- 回测摘要
-- 审计事件
-
-### Redis
-
-用于运行时加速：
-
-- 策略列表缓存
-- 回测列表缓存
-- 运行时联通检测缓存
-- 分布式锁预留
-
-## 已完成的性能优化
-
-- 回测摘要与回测详情拆分存储
-- 前端改为摘要列表 + 单条详情按需加载
-- GET 请求短 TTL 缓存与去重
-- 联通检测缓存与并行探测
-- 回测 OHLCV 改为直接走 FMZ 官方历史数据接口，去掉第二次 FMZ 引擎执行
-- 主存储支持切换到 MongoDB，缓存支持切换到 Redis
+- 架构说明见 [docs/architecture.md](D:\quantx-platform\docs\architecture.md)
