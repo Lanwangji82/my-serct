@@ -65,10 +65,6 @@ export default defineConfig(({ mode }) => {
           manualChunks(id) {
             if (!id.includes('node_modules')) return;
 
-            if (id.includes('lightweight-charts')) {
-              return 'vendor-charts';
-            }
-
             if (id.includes('recharts')) {
               return 'vendor-recharts';
             }

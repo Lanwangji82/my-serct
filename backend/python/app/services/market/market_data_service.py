@@ -92,7 +92,10 @@ class MarketDataService:
         normalized_limit = max(60, min(int(limit), 1200))
         normalized_exchange = self.crypto_provider.normalize_exchange_id(exchange_id) if normalized_market == "crypto" else None
         normalized_market_type = self.crypto_provider.normalize_market_type(market_type) if normalized_market == "crypto" else None
-        normalized_symbol = symbol or ("BTC/USDT" if normalized_market_type != "swap" else "BTC/USDT:USDT") if normalized_market == "crypto" else "000001.SH"
+        normalized_symbol = (
+            symbol
+            or (("BTC/USDT" if normalized_market_type != "swap" else "BTC/USDT:USDT") if normalized_market == "crypto" else "000001.SH")
+        )
         cache_key = f"{MARKET_SERIES_CACHE_PREFIX}{normalized_market}:{normalized_exchange or '-'}:{normalized_market_type or '-'}:{normalized_symbol}:{normalized_interval}:{normalized_limit}"
 
         if force_refresh:
@@ -106,7 +109,14 @@ class MarketDataService:
             )
 
         cached = self.redis_cache.get_json(cache_key)
-        if cached is not None:
+        if cached is not None and self._is_matching_series_payload(
+            cached,
+            market=normalized_market,
+            exchange_id=normalized_exchange,
+            market_type=normalized_market_type,
+            symbol=normalized_symbol,
+            interval=normalized_interval,
+        ):
             return cached
 
         if self.snapshot_repository is not None:
@@ -118,7 +128,14 @@ class MarketDataService:
                 interval=normalized_interval,
                 limit=normalized_limit,
             )
-            if snapshot is not None:
+            if snapshot is not None and self._is_matching_series_payload(
+                snapshot,
+                market=normalized_market,
+                exchange_id=normalized_exchange,
+                market_type=normalized_market_type,
+                symbol=normalized_symbol,
+                interval=normalized_interval,
+            ):
                 self.redis_cache.set_json(cache_key, snapshot, self.series_ttl_ms)
                 if self.refresh_scheduler is not None:
                     self.refresh_scheduler.enqueue_market_series_refresh(
@@ -243,7 +260,10 @@ class MarketDataService:
         normalized_limit = max(60, min(int(limit), 1200))
         normalized_exchange = self.crypto_provider.normalize_exchange_id(exchange_id) if normalized_market == "crypto" else None
         normalized_market_type = self.crypto_provider.normalize_market_type(market_type) if normalized_market == "crypto" else None
-        normalized_symbol = symbol or ("BTC/USDT" if normalized_market_type != "swap" else "BTC/USDT:USDT") if normalized_market == "crypto" else "000001.SH"
+        normalized_symbol = (
+            symbol
+            or (("BTC/USDT" if normalized_market_type != "swap" else "BTC/USDT:USDT") if normalized_market == "crypto" else "000001.SH")
+        )
 
         if normalized_market == "crypto":
             payload = self.crypto_provider.build_series(
@@ -341,6 +361,31 @@ class MarketDataService:
                 payload=payload,
                 updated_at=self.now_ms(),
             )
+
+    def _is_matching_series_payload(
+        self,
+        payload: dict[str, Any] | None,
+        *,
+        market: str,
+        exchange_id: str | None,
+        market_type: str | None,
+        symbol: str,
+        interval: str,
+    ) -> bool:
+        if not isinstance(payload, dict):
+            return False
+
+        payload_symbol = str(payload.get("symbol") or "").strip()
+        payload_interval = str(payload.get("interval") or "").strip()
+        if payload_symbol != symbol or payload_interval != interval:
+            return False
+
+        if market != "crypto":
+            return True
+
+        payload_exchange = str(payload.get("exchangeId") or "").strip()
+        payload_market_type = str(payload.get("marketType") or "").strip()
+        return payload_exchange == str(exchange_id or "") and payload_market_type == str(market_type or "")
 
     def _build_indicator_pack(self, candles: list[dict[str, Any]]) -> list[dict[str, Any]]:
         closes = [float(item["close"]) for item in candles]

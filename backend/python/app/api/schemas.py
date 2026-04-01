@@ -75,3 +75,32 @@ class LlmConfigRequest(BaseModel):
     apiKey: str = ""
     baseUrl: str = "https://api.openai.com/v1"
     model: str = "gpt-5.4-mini"
+
+
+class AccountConnectionCredentialsRequest(BaseModel):
+    apiKey: str = ""
+    apiSecret: str = ""
+    passphrase: str = ""
+
+
+class AccountScopeRequest(BaseModel):
+    scopeId: str | None = None
+    accountType: str = "spot"
+    connectionMode: Literal["live", "paper"] = "live"
+    enabled: bool = True
+    extraConfig: dict[str, Any] = Field(default_factory=dict)
+
+
+class AccountConnectionRequest(BaseModel):
+    accountId: str | None = None
+    label: str
+    market: Literal["crypto", "a_share"] = "crypto"
+    providerId: str
+    exchangeId: str | None = None
+    enabled: bool = True
+    credentials: AccountConnectionCredentialsRequest = Field(default_factory=AccountConnectionCredentialsRequest)
+    scopes: list[AccountScopeRequest] = Field(default_factory=list)
+
+
+class AccountConnectionStatusRequest(BaseModel):
+    enabled: bool

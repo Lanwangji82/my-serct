@@ -1,5 +1,5 @@
 import React from "react";
-import { Activity, LayoutDashboard, Settings, Search, User, Database, FlaskConical, Blocks, Radar, BarChart3 } from "lucide-react";
+import { Activity, Settings, Search, User, Database, FlaskConical, Blocks, Newspaper, Wallet } from "lucide-react";
 import { cn } from "../../lib/utils";
 import { Button } from "./ui";
 import { useTranslation } from "../../lib/i18n";
@@ -13,9 +13,8 @@ interface SidebarProps {
 export function Sidebar({ activeTab, setActiveTab }: SidebarProps) {
   const { t } = useTranslation();
   const navItems = [
-    { id: "dashboard", label: t("dashboard"), icon: LayoutDashboard },
-    { id: "intelligence", label: t("marketIntelligence"), icon: Radar },
-    { id: "market", label: t("marketCenter"), icon: BarChart3 },
+    { id: "intelligence", label: t("marketIntelligence"), icon: Newspaper },
+    { id: "portfolio", label: t("portfolio"), icon: Wallet },
     { id: "dataCenter", label: t("dataCenter"), icon: Database },
     { id: "backtesting", label: t("backtesting"), icon: FlaskConical },
     { id: "strategies", label: t("strategies"), icon: Blocks },

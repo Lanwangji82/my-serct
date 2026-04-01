@@ -184,7 +184,10 @@ function getCacheTtl(path: string) {
   if (path.includes("/runtime/operations")) return 10_000;
   if (path.includes("/intelligence/overview")) return 10_000;
   if (path.includes("/market/catalog")) return 60_000;
+  if (path.includes("/market/regime")) return 30_000;
   if (path.includes("/market/series")) return 15_000;
+  if (path.includes("/portfolio/positions")) return 1_000;
+  if (path.includes("/portfolio/accounts")) return 5_000;
   if (path.includes("/backtests/")) return 1_000;
   if (path.includes("/strategies") || path.includes("/me")) return 2_000;
   if (path.includes("/runtime/config")) return 10_000;

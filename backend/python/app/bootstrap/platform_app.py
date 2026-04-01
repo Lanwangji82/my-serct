@@ -7,15 +7,16 @@ from fastapi import FastAPI
 
 try:
     from ..api.intelligence_routes import register_intelligence_routes
-    from ..api.market_routes import register_market_routes
     from ..api.platform_routes import register_platform_routes
     from ..repositories.platform_repository import PlatformRepository
     from ..repositories.snapshot_repository import SnapshotRepository
     from ..services.core.audit_service import AuditService
     from ..services.core.auth_service import AuthService
     from ..services.backtest.backtest_service import BacktestService
+    from ..services.portfolio.portfolio_service import PortfolioService
     from ..services.runtime.data_provider_service import DataProviderService
     from ..services.market.market_data_service import MarketDataService
+    from ..services.market.market_regime_service import MarketRegimeService
     from ..services.intelligence.market_intelligence_service import MarketIntelligenceService
     from ..services.runtime.runtime_service import RuntimeService
     from ..services.strategy.strategy_service import StrategyService
@@ -24,15 +25,16 @@ try:
     from .platform_context import create_platform_context
 except ImportError:
     from api.intelligence_routes import register_intelligence_routes
-    from api.market_routes import register_market_routes
     from api.platform_routes import register_platform_routes
     from repositories.platform_repository import PlatformRepository
     from repositories.snapshot_repository import SnapshotRepository
     from services.core.audit_service import AuditService
     from services.core.auth_service import AuthService
     from services.backtest.backtest_service import BacktestService
+    from services.portfolio.portfolio_service import PortfolioService
     from services.runtime.data_provider_service import DataProviderService
     from services.market.market_data_service import MarketDataService
+    from services.market.market_regime_service import MarketRegimeService
     from services.intelligence.market_intelligence_service import MarketIntelligenceService
     from services.runtime.runtime_service import RuntimeService
     from services.strategy.strategy_service import StrategyService
@@ -52,9 +54,11 @@ class PlatformAppBundle:
     audit_service: AuditService
     strategy_service: StrategyService
     backtest_service: BacktestService
+    portfolio_service: PortfolioService
     runtime_service: RuntimeService
     data_provider_service: DataProviderService
     market_data_service: MarketDataService
+    market_regime_service: MarketRegimeService
     market_intelligence_service: MarketIntelligenceService
     refresh_scheduler_service: Any
     broker_latency_adapter: Any
@@ -76,6 +80,7 @@ def create_platform_app_bundle() -> PlatformAppBundle:
         audit_service=services.audit_service,
         strategy_service=services.strategy_service,
         backtest_service=services.backtest_service,
+        portfolio_service=services.portfolio_service,
         runtime_service=services.runtime_service,
         data_provider_service=services.data_provider_service,
         broker_latency_adapter=adapters.broker_latency_adapter,
@@ -85,12 +90,6 @@ def create_platform_app_bundle() -> PlatformAppBundle:
         auth_service=services.auth_service,
         market_intelligence_service=services.market_intelligence_service,
     )
-    register_market_routes(
-        app,
-        auth_service=services.auth_service,
-        market_data_service=services.market_data_service,
-    )
-
     background_worker = context["background_worker_factory"](services.refresh_scheduler_service.process_next_job)
     services.runtime_service.background_worker_getter = lambda: background_worker
 
@@ -113,9 +112,11 @@ def create_platform_app_bundle() -> PlatformAppBundle:
         audit_service=services.audit_service,
         strategy_service=services.strategy_service,
         backtest_service=services.backtest_service,
+        portfolio_service=services.portfolio_service,
         runtime_service=services.runtime_service,
         data_provider_service=services.data_provider_service,
         market_data_service=services.market_data_service,
+        market_regime_service=services.market_regime_service,
         market_intelligence_service=services.market_intelligence_service,
         refresh_scheduler_service=services.refresh_scheduler_service,
         broker_latency_adapter=adapters.broker_latency_adapter,

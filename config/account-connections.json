@@ -1,0 +1,89 @@
+{
+  "accounts": [
+    {
+      "accountId": "acct_93bc29b4f5a1020c",
+      "label": "Binance 账户",
+      "market": "crypto",
+      "providerId": "binance",
+      "brokerId": "binance",
+      "exchangeId": "binance",
+      "enabled": true,
+      "mode": "readonly",
+      "credentials": {
+        "apiKey": "AUJimzs4BKSts09vxFszPs6j3e7MXgRwA87PsadCC43rbLLgjhWCbFratQ4MPNDe",
+        "apiSecret": "UvLpIL7x7ZgmdLLtGSrK6lDoMo18qufRr3Xgu5ryxNEHaBKQcFyvLD6MtYJvKUFW",
+        "passphrase": ""
+      },
+      "status": {
+        "ok": true,
+        "code": "connected",
+        "message": "Account scopes ready: spot/live, spot/paper, futures/live, futures/paper",
+        "checkedAt": 1774931131700
+      },
+      "scopes": [
+        {
+          "scopeId": "scope_a6b73971c407bd19",
+          "accountType": "spot",
+          "connectionMode": "live",
+          "enabled": true,
+          "extraConfig": {},
+          "status": {
+            "ok": false,
+            "code": "",
+            "message": "",
+            "checkedAt": 0
+          },
+          "createdAt": 1774931105149,
+          "updatedAt": 1774931105149
+        },
+        {
+          "scopeId": "scope_31060df299b80294",
+          "accountType": "spot",
+          "connectionMode": "paper",
+          "enabled": true,
+          "extraConfig": {},
+          "status": {
+            "ok": false,
+            "code": "",
+            "message": "",
+            "checkedAt": 0
+          },
+          "createdAt": 1774931105149,
+          "updatedAt": 1774931105149
+        },
+        {
+          "scopeId": "scope_03bbb343e78c1cc5",
+          "accountType": "futures",
+          "connectionMode": "live",
+          "enabled": true,
+          "extraConfig": {},
+          "status": {
+            "ok": false,
+            "code": "",
+            "message": "",
+            "checkedAt": 0
+          },
+          "createdAt": 1774931105149,
+          "updatedAt": 1774931105149
+        },
+        {
+          "scopeId": "scope_7556969e34b7e7eb",
+          "accountType": "futures",
+          "connectionMode": "paper",
+          "enabled": true,
+          "extraConfig": {},
+          "status": {
+            "ok": false,
+            "code": "",
+            "message": "",
+            "checkedAt": 0
+          },
+          "createdAt": 1774931105149,
+          "updatedAt": 1774931105149
+        }
+      ],
+      "createdAt": 1774931105149,
+      "updatedAt": 1774931131700
+    }
+  ]
+}

@@ -7,10 +7,28 @@ from fastapi.responses import JSONResponse
 
 try:
     from ..adapters.runtime.runtime_config_store import NetworkClientSettingsPayload
-    from .schemas import BacktestRequest, LlmConfigRequest, LoginRequest, StrategyCompileRequest, StrategyRequest, TushareConfigRequest
+    from .schemas import (
+        AccountConnectionRequest,
+        AccountConnectionStatusRequest,
+        BacktestRequest,
+        LlmConfigRequest,
+        LoginRequest,
+        StrategyCompileRequest,
+        StrategyRequest,
+        TushareConfigRequest,
+    )
 except ImportError:
     from adapters.runtime.runtime_config_store import NetworkClientSettingsPayload
-    from api.schemas import BacktestRequest, LlmConfigRequest, LoginRequest, StrategyCompileRequest, StrategyRequest, TushareConfigRequest
+    from api.schemas import (
+        AccountConnectionRequest,
+        AccountConnectionStatusRequest,
+        BacktestRequest,
+        LlmConfigRequest,
+        LoginRequest,
+        StrategyCompileRequest,
+        StrategyRequest,
+        TushareConfigRequest,
+    )
 
 
 def register_platform_routes(
@@ -23,6 +41,7 @@ def register_platform_routes(
     audit_service,
     strategy_service,
     backtest_service,
+    portfolio_service,
     runtime_service,
     data_provider_service,
     broker_latency_adapter,
@@ -168,6 +187,41 @@ def register_platform_routes(
     def audit(authorization: str | None = Header(default=None)):
         user = auth_service.require_user(authorization)
         return audit_service.list_for_user(user["id"])
+
+    @app.get("/portfolio/positions")
+    def portfolio_positions(
+        market: str | None = None,
+        accountId: str | None = None,
+        connectionMode: str | None = None,
+        authorization: str | None = Header(default=None),
+    ):
+        auth_service.require_user(authorization)
+        return portfolio_service.get_positions(market=market, account_id=accountId, connection_mode=connectionMode)
+
+    @app.get("/api/platform/portfolio/accounts")
+    def list_portfolio_accounts(authorization: str | None = Header(default=None)):
+        auth_service.require_user(authorization)
+        return portfolio_service.list_account_connections()
+
+    @app.post("/api/platform/portfolio/accounts")
+    def save_portfolio_account(payload: AccountConnectionRequest, authorization: str | None = Header(default=None)):
+        auth_service.require_user(authorization)
+        return portfolio_service.save_account_connection(payload.model_dump())
+
+    @app.post("/api/platform/portfolio/accounts/{account_id}/status")
+    def set_portfolio_account_status(account_id: str, payload: AccountConnectionStatusRequest, authorization: str | None = Header(default=None)):
+        auth_service.require_user(authorization)
+        return portfolio_service.set_account_connection_enabled(account_id, payload.enabled)
+
+    @app.post("/api/platform/portfolio/accounts/{account_id}/test")
+    def test_portfolio_account_connection(account_id: str, authorization: str | None = Header(default=None)):
+        auth_service.require_user(authorization)
+        return portfolio_service.test_account_connection(account_id=account_id)
+
+    @app.delete("/api/platform/portfolio/accounts/{account_id}")
+    def delete_portfolio_account(account_id: str, authorization: str | None = Header(default=None)):
+        auth_service.require_user(authorization)
+        return portfolio_service.delete_account_connection(account_id)
 
     @app.exception_handler(HTTPException)
     async def http_exception_handler(_request, exc: HTTPException):

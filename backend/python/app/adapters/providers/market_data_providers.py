@@ -314,7 +314,7 @@ class AshareMarketProvider:
 
     def build_series(self, *, symbol: str, interval: str, limit: int) -> dict[str, Any]:
         spec = self._resolve_symbol(symbol)
-        candles, source_ok, source_detail = self._fetch_eastmoney_kline(spec, interval, limit)
+        candles, source_ok, source_detail, source_meta = self._fetch_a_share_kline(spec, interval, limit)
         snapshot = self._build_snapshot_from_candles(spec["label"], spec["symbol"], candles)
         return {
             "generatedAt": self.now_ms(),
@@ -326,8 +326,8 @@ class AshareMarketProvider:
             "symbolLabel": spec["label"],
             "interval": interval,
             "source": {
-                "sourceId": "eastmoney-kline",
-                "label": "东方财富 K线",
+                "sourceId": source_meta["sourceId"],
+                "label": source_meta["label"],
                 "ok": source_ok,
                 "detail": source_detail,
                 "updatedAt": self.now_ms(),
@@ -357,6 +357,48 @@ class AshareMarketProvider:
             normalized = f"{code}.SZ"
             secid = f"0.{code}"
         return {"symbol": normalized, "label": code, "kind": "stock", "secid": secid}
+
+    def _fetch_a_share_kline(self, spec: dict[str, str], interval: str, limit: int) -> tuple[list[dict[str, Any]], bool, str, dict[str, str]]:
+        if interval in {"5m", "15m", "30m", "60m"}:
+            try:
+                candles = self._fetch_sina_intraday_kline(spec, interval, limit)
+                if candles:
+                    return (
+                        candles,
+                        True,
+                        f"已通过新浪行情拉取 {len(candles)} 根 {interval} K线。",
+                        {"sourceId": "sina-kline", "label": "新浪行情 K线"},
+                    )
+            except Exception as exc:
+                fallback_candles, source_ok, source_detail = self._fetch_eastmoney_kline(spec, interval, limit)
+                return (
+                    fallback_candles,
+                    source_ok,
+                    f"新浪行情失败：{exc}；{source_detail}",
+                    {"sourceId": "eastmoney-kline", "label": "东方财富 K线"},
+                )
+
+        if interval in {"1d", "1w"}:
+            try:
+                candles = self._fetch_tencent_kline(spec, interval, limit)
+                if candles:
+                    return (
+                        candles,
+                        True,
+                        f"已通过腾讯行情拉取 {len(candles)} 根 {interval} K线。",
+                        {"sourceId": "tencent-kline", "label": "腾讯行情 K线"},
+                    )
+            except Exception as exc:
+                fallback_candles, source_ok, source_detail = self._fetch_eastmoney_kline(spec, interval, limit)
+                return (
+                    fallback_candles,
+                    source_ok,
+                    f"腾讯行情失败：{exc}；{source_detail}",
+                    {"sourceId": "eastmoney-kline", "label": "东方财富 K线"},
+                )
+
+        candles, source_ok, source_detail = self._fetch_eastmoney_kline(spec, interval, limit)
+        return candles, source_ok, source_detail, {"sourceId": "eastmoney-kline", "label": "东方财富 K线"}
 
     def _fetch_eastmoney_kline(self, spec: dict[str, str], interval: str, limit: int) -> tuple[list[dict[str, Any]], bool, str]:
         klt = {"5m": "5", "15m": "15", "30m": "30", "60m": "60", "1d": "101", "1w": "102"}.get(interval, "101")
@@ -397,6 +439,65 @@ class AshareMarketProvider:
         except Exception as exc:
             return self._seed_a_share_candles(spec, interval, limit), False, f"{exc}，已回退示例行情。"
 
+    def _fetch_tencent_kline(self, spec: dict[str, str], interval: str, limit: int) -> list[dict[str, Any]]:
+        code = spec["symbol"].split(".")[0]
+        prefix = "sh" if spec["symbol"].endswith(".SH") else "sz"
+        market_symbol = f"{prefix}{code}"
+        kline_type = "day" if interval == "1d" else "week"
+        query = urllib.parse.urlencode({"param": f"{market_symbol},{kline_type},,,{limit},qfq"})
+        url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?{query}"
+        payload = json.loads(self._fetch_text(url))
+        data = (payload.get("data") or {}).get(market_symbol) or {}
+        rows = data.get(f"qfq{kline_type}") or data.get(kline_type) or []
+        candles: list[dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, list) or len(row) < 6:
+                continue
+            candles.append(
+                {
+                    "ts": self._eastmoney_time_to_ts(str(row[0])),
+                    "open": float(row[1]),
+                    "close": float(row[2]),
+                    "high": float(row[3]),
+                    "low": float(row[4]),
+                    "volume": float(row[5]),
+                }
+            )
+        if not candles:
+            raise RuntimeError("腾讯行情未返回 K 线数据。")
+        return candles[-limit:]
+
+    def _fetch_sina_intraday_kline(self, spec: dict[str, str], interval: str, limit: int) -> list[dict[str, Any]]:
+        code = spec["symbol"].split(".")[0]
+        prefix = "sh" if spec["symbol"].endswith(".SH") else "sz"
+        market_symbol = f"{prefix}{code}"
+        scale = {"5m": "5", "15m": "15", "30m": "30", "60m": "60"}[interval]
+        query = urllib.parse.urlencode({"symbol": market_symbol, "scale": scale, "ma": "no", "datalen": str(limit)})
+        url = f"https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_data=/CN_MarketDataService.getKLineData?{query}"
+        raw_text = self._fetch_text(url)
+        start = raw_text.find("(")
+        end = raw_text.rfind(")")
+        if start < 0 or end <= start:
+            raise RuntimeError("新浪行情未返回可解析的分钟 K 线。")
+        payload = json.loads(raw_text[start + 1 : end])
+        candles: list[dict[str, Any]] = []
+        for row in payload or []:
+            if not isinstance(row, dict):
+                continue
+            candles.append(
+                {
+                    "ts": self._eastmoney_time_to_ts(str(row.get("day") or "")),
+                    "open": float(row.get("open") or 0),
+                    "close": float(row.get("close") or 0),
+                    "high": float(row.get("high") or 0),
+                    "low": float(row.get("low") or 0),
+                    "volume": float(row.get("volume") or 0),
+                }
+            )
+        if not candles:
+            raise RuntimeError("新浪行情未返回分钟 K 线数据。")
+        return candles[-limit:]
+
     def _build_snapshot_from_candles(self, label: str, symbol: str, candles: list[dict[str, Any]]) -> dict[str, Any]:
         last = candles[-1]
         recent = candles[-30:] if len(candles) >= 30 else candles
@@ -436,6 +537,8 @@ class AshareMarketProvider:
             return response.read().decode(response.headers.get_content_charset() or "utf-8", errors="ignore")
 
     def _eastmoney_time_to_ts(self, value: str) -> int:
+        if len(value.strip()) == 19:
+            return int(datetime.strptime(value, "%Y-%m-%d %H:%M:%S").timestamp() * 1000)
         if " " in value:
             return int(datetime.strptime(value, "%Y-%m-%d %H:%M").timestamp() * 1000)
         return int(datetime.strptime(value, "%Y-%m-%d").timestamp() * 1000)

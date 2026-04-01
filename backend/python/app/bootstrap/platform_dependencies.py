@@ -21,6 +21,16 @@ try:
         validate_llm_settings,
         validate_tushare_settings,
     )
+    from ..adapters.providers.account_connection_store import (
+        delete_account_connection,
+        get_account_connection,
+        iter_raw_account_scopes,
+        list_account_connections,
+        list_raw_account_connections,
+        save_account_connection,
+        set_account_connection_status,
+        update_account_connection_status,
+    )
     from ..adapters.search.milvus_retriever import build_semantic_retriever
     from ..adapters.interfaces import BrokerLatencyProvider, NetworkRuntimeAdapter
     from ..repositories.platform_repository import PlatformRepository
@@ -28,8 +38,11 @@ try:
     from ..services.core.audit_service import AuditService
     from ..services.core.auth_service import AuthService
     from ..services.backtest.backtest_service import BacktestService
+    from ..services.portfolio.portfolio_service import PortfolioService
+    from ..services.portfolio.portfolio_service import BinancePortfolioAdapter, ManualASharePortfolioAdapter, OkxPortfolioAdapter
     from ..services.runtime.data_provider_service import DataProviderService
     from ..services.market.market_data_service import MarketDataService
+    from ..services.market.market_regime_service import MarketRegimeService
     from ..services.intelligence.market_intelligence_service import MarketIntelligenceService
     from ..services.runtime.refresh_scheduler_service import RefreshSchedulerService
     from ..services.runtime.runtime_service import RuntimeService
@@ -60,6 +73,16 @@ except ImportError:
         validate_llm_settings,
         validate_tushare_settings,
     )
+    from adapters.providers.account_connection_store import (
+        delete_account_connection,
+        get_account_connection,
+        iter_raw_account_scopes,
+        list_account_connections,
+        list_raw_account_connections,
+        save_account_connection,
+        set_account_connection_status,
+        update_account_connection_status,
+    )
     from adapters.search.milvus_retriever import build_semantic_retriever
     from adapters.interfaces import BrokerLatencyProvider, NetworkRuntimeAdapter
     from repositories.platform_repository import PlatformRepository
@@ -67,8 +90,11 @@ except ImportError:
     from services.core.audit_service import AuditService
     from services.core.auth_service import AuthService
     from services.backtest.backtest_service import BacktestService
+    from services.portfolio.portfolio_service import PortfolioService
+    from services.portfolio.portfolio_service import BinancePortfolioAdapter, ManualASharePortfolioAdapter, OkxPortfolioAdapter
     from services.runtime.data_provider_service import DataProviderService
     from services.market.market_data_service import MarketDataService
+    from services.market.market_regime_service import MarketRegimeService
     from services.intelligence.market_intelligence_service import MarketIntelligenceService
     from services.runtime.refresh_scheduler_service import RefreshSchedulerService
     from services.runtime.runtime_service import RuntimeService
@@ -101,9 +127,11 @@ class PlatformServiceBundle:
     audit_service: AuditService
     strategy_service: StrategyService
     backtest_service: BacktestService
+    portfolio_service: PortfolioService
     runtime_service: RuntimeService
     data_provider_service: DataProviderService
     market_data_service: MarketDataService
+    market_regime_service: MarketRegimeService
     market_intelligence_service: MarketIntelligenceService
     refresh_scheduler_service: RefreshSchedulerService
 
@@ -124,6 +152,11 @@ def create_platform_service_bundle(
     context: dict[str, Any],
     adapters: PlatformAdapterBundle,
 ) -> PlatformServiceBundle:
+    try:
+        import ccxt  # type: ignore
+    except Exception:
+        ccxt = None
+
     storage = context.get("storage_bundle")
     repository = PlatformRepository(storage.db if storage is not None else context["db"])
     snapshot_repository = SnapshotRepository(repository)
@@ -240,6 +273,13 @@ def create_platform_service_bundle(
         semantic_retriever=semantic_retriever,
     )
 
+    market_regime_service = MarketRegimeService(
+        redis_cache=storage.redis_cache if storage is not None else context["redis_cache"],
+        now_ms=context["now_ms"],
+        market_data_service=market_data_service,
+        market_intelligence_service=market_intelligence_service,
+    )
+
     refresh_scheduler_service = RefreshSchedulerService(
         background_job_queue=context["background_job_queue"],
         market_data_service=market_data_service,
@@ -248,6 +288,32 @@ def create_platform_service_bundle(
     market_data_service.refresh_scheduler = refresh_scheduler_service
     market_intelligence_service.refresh_scheduler = refresh_scheduler_service
     runtime_service.refresh_scheduler_service = refresh_scheduler_service
+    portfolio_service = PortfolioService(
+        now_ms=context["now_ms"],
+        create_id=context["create_id"],
+        account_connection_store={
+            "list": list_account_connections,
+            "list_raw": list_raw_account_connections,
+            "iter_scopes": iter_raw_account_scopes,
+            "get": get_account_connection,
+            "save": save_account_connection,
+            "set_enabled": set_account_connection_status,
+            "delete": delete_account_connection,
+            "update_status": update_account_connection_status,
+        },
+        market_regime_service=market_regime_service,
+        market_intelligence_service=market_intelligence_service,
+        provider_adapters={
+            "binance": BinancePortfolioAdapter(
+                ccxt_module=ccxt,
+                proxy_environment_resolver=adapters.network_runtime_adapter.get_proxy_environment,
+            ),
+            "okx": OkxPortfolioAdapter(
+                proxy_environment_resolver=adapters.network_runtime_adapter.get_proxy_environment,
+            ),
+            "manual": ManualASharePortfolioAdapter(),
+        },
+    )
 
     return PlatformServiceBundle(
         repository=repository,
@@ -256,9 +322,11 @@ def create_platform_service_bundle(
         audit_service=audit_service,
         strategy_service=strategy_service,
         backtest_service=backtest_service,
+        portfolio_service=portfolio_service,
         runtime_service=runtime_service,
         data_provider_service=data_provider_service,
         market_data_service=market_data_service,
+        market_regime_service=market_regime_service,
         market_intelligence_service=market_intelligence_service,
         refresh_scheduler_service=refresh_scheduler_service,
     )

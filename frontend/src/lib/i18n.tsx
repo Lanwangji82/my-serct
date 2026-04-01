@@ -3,12 +3,11 @@
 type Language = "en" | "zh";
 
 const en = {
-  dashboard: "Dashboard",
   dataCenter: "Data Center",
   backtesting: "Backtesting",
   strategies: "Strategies",
-  marketIntelligence: "Market Intelligence",
-  marketCenter: "Market Center",
+  marketIntelligence: "News Feed",
+  portfolio: "Portfolio",
   settings: "Settings",
   searchPlaceholder: "Search strategies, market, settings...",
   status: "Status",
@@ -51,12 +50,11 @@ const en = {
 
 const zh: typeof en = {
   ...en,
-  dashboard: "总览",
   dataCenter: "数据中心",
   backtesting: "回测中心",
   strategies: "策略",
-  marketIntelligence: "市场情报",
-  marketCenter: "行情中心",
+  marketIntelligence: "新闻流",
+  portfolio: "持仓",
   settings: "设置",
   searchPlaceholder: "搜索策略、研究、配置项...",
   status: "状态",
